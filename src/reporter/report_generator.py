@@ -103,6 +103,39 @@ class ReportGenerator:
 
 """
 
+    def _generate_top3_ranking(self, stats: Dict[str, Any]) -> str:
+        """편지 top3, 게시글 top3 비중을 한 줄 요약으로 표시"""
+        master_stats = stats["master_stats"]
+        total = stats["total_stats"]["this_week"]
+
+        # 편지 top3
+        letter_ranking = sorted(
+            [(name, data["this_week"]["letters"]) for name, data in master_stats.items()
+             if data["this_week"]["letters"] > 0],
+            key=lambda x: x[1], reverse=True
+        )[:3]
+
+        # 게시글 top3
+        post_ranking = sorted(
+            [(name, data["this_week"]["posts"]) for name, data in master_stats.items()
+             if data["this_week"]["posts"] > 0],
+            key=lambda x: x[1], reverse=True
+        )[:3]
+
+        result = ""
+
+        if letter_ranking and total['letters'] > 0:
+            names = "·".join([name for name, _ in letter_ranking])
+            total_pct = sum(count for _, count in letter_ranking) / total['letters'] * 100
+            result += f"편지 Top3({names}) 비중: **약 {total_pct:.0f}%**\n\n"
+
+        if post_ranking and total['posts'] > 0:
+            names = "·".join([name for name, _ in post_ranking])
+            total_pct = sum(count for _, count in post_ranking) / total['posts'] * 100
+            result += f"게시글 Top3({names}) 비중: **약 {total_pct:.0f}%**\n\n"
+
+        return result
+
     def _generate_summary(self, stats: Dict[str, Any]) -> str:
         """핵심 요약 생성"""
         total = stats["total_stats"]
@@ -118,45 +151,87 @@ class ReportGenerator:
 | 전체 게시글 건수 | {this_week['posts']} | {last_week['posts']} | {self._format_change(change['posts'])} |
 | 전체 총합        | {this_week['total']} | {last_week['total']} | {self._format_change(change['total'])} |
 
+### 핵심 이슈
+
 """
 
-        # LLM API로 인사이트 생성
-        insight = self._generate_insight_summary(stats)
-        summary += f"{insight}\n"
+        # LLM API로 핵심 이슈 생성
+        key_issues = self._generate_key_issues(stats)
+        summary += f"{key_issues}\n"
 
         summary += f"""(총합: 편지 {this_week['letters']}건 / 게시글 {this_week['posts']}건)
 
----
+"""
+
+        # Top 3 랭킹 추가
+        summary += self._generate_top3_ranking(stats)
+
+        summary += """---
 
 """
         return summary
 
-    def _generate_insight_summary(self, stats: Dict[str, Any]) -> str:
-        """LLM API를 사용한 인사이트 요약 생성"""
+    def _generate_key_issues(self, stats: Dict[str, Any]) -> str:
+        """LLM API를 사용한 핵심 이슈 3개 생성 (특정 마스터 비특정)"""
         total = stats["total_stats"]
         category_stats = stats["category_stats"]
+        master_stats = stats["master_stats"]
 
-        prompt = f"""다음은 금융 콘텐츠 플랫폼의 주간 이용자 반응 통계입니다:
+        # 마스터별 주요 콘텐츠 샘플 수집 (마스터명 제거)
+        all_contents_sample = []
+        for master_name, data in sorted(
+            master_stats.items(),
+            key=lambda x: x[1]["this_week"]["total"],
+            reverse=True
+        )[:8]:  # 상위 8개 마스터만
+            for c in data.get("contents", [])[:10]:
+                text = c.get("content", "")
+                cat = c.get("category", "")
+                if text:
+                    all_contents_sample.append(f"[{cat}] {text}")
+
+        contents_str = "\n".join(all_contents_sample[:50])
+
+        prompt = f"""다음은 금융 투자 커뮤니티 플랫폼의 이번 주 이용자 반응 데이터입니다.
 
 [전체 통계]
 - 이번 주: 편지 {total['this_week']['letters']}건, 게시글 {total['this_week']['posts']}건
 - 전주: 편지 {total['last_week']['letters']}건, 게시글 {total['last_week']['posts']}건
-- 증감: 편지 {total['change']['letters']}, 게시글 {total['change']['posts']}
 
 [카테고리별 통계]
 {chr(10).join([f"- {cat}: {count}건" for cat, count in category_stats.items()])}
 
-위 데이터를 바탕으로 2-3문장으로 핵심 인사이트를 작성해주세요.
-- 전주 대비 증감 추세와 눈에 띄는 수치 변화를 중심으로 작성
-- 데이터에 나온 팩트만 언급할 것. "커뮤니티 활성화", "소통 강화" 등 추상적 표현 금지
-- 구체적 수치(건수, 증감률)를 포함할 것
+[이용자 반응 샘플]
+{contents_str}
 
-markdown 불릿 포인트 형식으로 작성해주세요."""
+위 데이터를 바탕으로 핵심 이슈 3개를 작성해주세요.
+
+## 작성 원칙
+- 특정 마스터 이름을 절대 언급하지 말 것. "일부 커뮤니티", "특정 클럽" 등으로 표현
+- 여러 클럽에 걸쳐 나타나는 전반적인 추세와 경향을 중심으로 작성
+- 데이터에 실제로 나온 내용만 언급. 추측이나 해석 금지
+- "커뮤니티 활성화", "소통 강화" 등 추상적·미사여구 표현 금지
+- 각 이슈는 제목 + 2-3문장 설명으로 구성
+
+## 형식
+반드시 아래 형식으로 작성:
+
+**1. 구체적 이슈 제목**
+
+2-3문장 설명. 구체적 맥락과 데이터에 기반한 팩트 중심.
+
+**2. 구체적 이슈 제목**
+
+2-3문장 설명.
+
+**3. 구체적 이슈 제목**
+
+2-3문장 설명."""
 
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                max_tokens=500,
+                max_tokens=1500,
                 temperature=0.3,
                 messages=[
                     {"role": "user", "content": prompt}
@@ -166,7 +241,6 @@ markdown 불릿 포인트 형식으로 작성해주세요."""
             return response.choices[0].message.content.strip()
 
         except Exception as e:
-            # API 오류시 기본 텍스트 반환
             return f"- 이번 주 전체 이용자 반응 규모는 총 {total['this_week']['total']}건입니다."
 
     def _generate_master_details(self, stats: Dict[str, Any]) -> str:
@@ -180,20 +254,34 @@ markdown 불릿 포인트 형식으로 작성해주세요."""
             reverse=True
         )
 
-        # 활성 마스터만 필터링
+        # 5건 이상 마스터 vs 기타 마스터 분리
+        MIN_THRESHOLD = 5
         active_masters = [
             (name, data) for name, data in sorted_masters
-            if data["this_week"]["total"] > 0
+            if data["this_week"]["total"] >= MIN_THRESHOLD
+        ]
+        minor_masters = [
+            (name, data) for name, data in sorted_masters
+            if 0 < data["this_week"]["total"] < MIN_THRESHOLD
         ]
 
         # LLM API 병렬 호출로 인사이트 생성
         insights = {}
         max_workers = min(5, len(active_masters))  # 최대 5개 동시 호출
         print(f"  마스터 인사이트 생성 중... ({len(active_masters)}명, 병렬 {max_workers}개)")
+        if minor_masters:
+            minor_names = [name for name, _ in minor_masters]
+            minor_total = sum(d["this_week"]["total"] for _, d in minor_masters)
+            print(f"  ⚠️  기타 마스터 {len(minor_masters)}명 ({minor_total}건, 5건 미만): {', '.join(minor_names)}")
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_master = {
-                executor.submit(self._generate_master_insight, name, data): name
+                executor.submit(
+                    self._generate_master_insight,
+                    name,
+                    data,
+                    data["this_week"]["total"] < 20  # 20건 미만이면 축약 모드
+                ): name
                 for name, data in active_masters
             }
             for future in as_completed(future_to_master):
@@ -238,13 +326,23 @@ markdown 불릿 포인트 형식으로 작성해주세요."""
 
 {insight['main_content']}
 
-■ 플랫폼/서비스 피드백
+■ 서비스 피드백
 
 {insight['service_feedback']}
 
-■ 체크 포인트
+---
 
-{insight['checkpoints']}
+"""
+
+        # 기타 마스터 섹션 추가
+        if minor_masters:
+            minor_names = [name for name, _ in minor_masters]
+            minor_total = sum(d["this_week"]["total"] for _, d in minor_masters)
+            details += f"""## 기타 마스터
+
+> 편지+게시글 총합 {MIN_THRESHOLD}건 미만으로 분석 대상에서 제외하였습니다.
+
+- 해당 마스터: {', '.join(minor_names)} (총 {minor_total}건)
 
 ---
 
@@ -252,8 +350,8 @@ markdown 불릿 포인트 형식으로 작성해주세요."""
 
         return details
 
-    def _generate_master_insight(self, master_name: str, data: Dict[str, Any]) -> Dict[str, str]:
-        """LLM API로 마스터별 상세 인사이트 생성"""
+    def _generate_master_insight(self, master_name: str, data: Dict[str, Any], compact: bool = False) -> Dict[str, str]:
+        """LLM API로 마스터별 상세 인사이트 생성 (compact=True: 20건 미만 축약 모드)"""
         contents = data.get("contents", [])
         categories = data.get("categories", {})
         change = data.get("change", {})
@@ -264,7 +362,6 @@ markdown 불릿 포인트 형식으로 작성해주세요."""
                 "summary": "반응 데이터가 부족하여 상세 분석이 어렵습니다.",
                 "main_content": "- 분석할 콘텐츠가 없습니다.",
                 "service_feedback": "- 서비스 피드백이 없습니다.",
-                "checkpoints": "- 특이사항 없음."
             }
 
         # 일반 콘텐츠와 서비스 관련 콘텐츠 분리
@@ -315,7 +412,7 @@ markdown 불릿 포인트 형식으로 작성해주세요."""
 [서비스 피드백 및 불편사항]
 {feedback_str}
 
-위 데이터를 분석하여 다음 4가지를 작성해주세요.
+위 데이터를 분석하여 다음 3가지를 작성해주세요.
 
 ## 작성 원칙
 - 데이터에 실제로 나온 내용만 언급할 것. 추측이나 해석을 넣지 말 것.
@@ -326,7 +423,7 @@ markdown 불릿 포인트 형식으로 작성해주세요."""
 
 1. **summary**: 한 줄 요약. 데이터에 기반한 팩트 중심으로 작성. (예: "편지 수는 감소했으나, 포트폴리오 구성과 종목 관련 질문이 중심인 주간입니다.")
 
-2. **main_content**: 주요 내용을 테마별로 정리 (2-4개 테마)
+2. **main_content**: 주요 내용을 테마별로 정리 ({('2개 테마' if compact else '2-4개 테마')})
    - 비슷한 내용끼리 묶어서 테마로 구성
    - 각 테마마다 2-3문장으로 충분히 설명하고, 맥락과 배경을 포함할 것
    - 대표 인용문은 가장 핵심적인 원문을 그대로 사용 (긴 인용 OK)
@@ -339,15 +436,13 @@ markdown 불릿 포인트 형식으로 작성해주세요."""
 
 3. **service_feedback**: 서비스 피드백 (하나의 문자열로 작성)
    - 서비스 관련 내용이 없으면 "- 서비스 관련 피드백 없음"으로 작성
-   - 있으면 불릿 포인트로 간결하게 정리하고 대표 인용문 1개 첨부
-
-4. **checkpoints**: 체크 포인트 (하나의 문자열로 작성, 불릿 포인트 1-3개)
-   - 실제 데이터에서 드러난 이슈만 기재. 일반론적 권고사항은 넣지 말 것.
-   - 대응이 필요한 사항이 없으면 "- 특이사항 없음"으로 작성
+   - 있으면 전체 내용을 한 문장으로 요약하고, 대표 인용문 1개만 첨부
+   - 담당자들이 실시간으로 처리한 내용이므로 추이만 간결하게 보여주면 됨
+   - 형식 예시: "VOD 업로드 지연, 결제 오류 등 서비스 관련 피드백이 N건 접수되었습니다.\\n\\n> _\\"인용문\\"_"
 
 ## 응답 형식
 반드시 JSON 객체로 응답하되, 모든 값은 문자열(string)이어야 합니다. 리스트나 배열을 사용하지 마세요.
-{{"summary": "문자열", "main_content": "문자열", "service_feedback": "문자열", "checkpoints": "문자열"}}"""
+{{"summary": "문자열", "main_content": "문자열", "service_feedback": "문자열"}}"""
 
         try:
             response = self.client.chat.completions.create(
@@ -396,11 +491,14 @@ markdown 불릿 포인트 형식으로 작성해주세요."""
                         return "\n".join(parts)
                     return str(value)
 
+                main_content = _to_markdown(result.get("main_content", "- 분석 결과 없음"))
+                # 번호 항목(**N.) 사이에 빈 줄이 확실히 들어가도록 후처리
+                main_content = re.sub(r'\n(\*\*\d+\.)', r'\n\n\1', main_content)
+
                 return {
                     "summary": _to_markdown(result.get("summary", "분석 결과 없음")),
-                    "main_content": _to_markdown(result.get("main_content", "- 분석 결과 없음")),
+                    "main_content": main_content,
                     "service_feedback": _to_markdown(result.get("service_feedback", "- 서비스 피드백 없음")),
-                    "checkpoints": _to_markdown(result.get("checkpoints", "- 특이사항 없음"))
                 }
 
         except Exception as e:
@@ -475,37 +573,32 @@ markdown 불릿 포인트 형식으로 작성해주세요."""
             elif cat == "서비스 제보/건의" and text:
                 suggestion_items.append(text)
 
-        service_feedback_parts = []
-        if complaint_items:
-            service_feedback_parts.append(f"**[서비스 불편사항]** {len(complaint_items)}건\n")
-            sample = complaint_items[0][:120]
-            service_feedback_parts.append(f"> _\"{sample}{'...' if len(complaint_items[0]) > 120 else ''}\"_\n")
-        if suggestion_items:
-            service_feedback_parts.append(f"**[서비스 제보/건의]** {len(suggestion_items)}건\n")
-            sample = suggestion_items[0][:120]
-            service_feedback_parts.append(f"> _\"{sample}{'...' if len(suggestion_items[0]) > 120 else ''}\"_\n")
-        if feedback_items:
-            service_feedback_parts.append(f"**[서비스 피드백]** {len(feedback_items)}건\n")
-            sample = feedback_items[0][:120]
-            service_feedback_parts.append(f"> _\"{sample}{'...' if len(feedback_items[0]) > 120 else ''}\"_\n")
+        # 서비스 피드백: 한 문장 요약 + 인용구 1개
+        total_feedback = len(complaint_items) + len(suggestion_items) + len(feedback_items)
+        if total_feedback > 0:
+            # 대표 인용문 1개 선택 (불편사항 우선)
+            representative = (complaint_items or suggestion_items or feedback_items)[0]
+            sample = representative[:120]
+            quote = f"{sample}{'...' if len(representative) > 120 else ''}"
 
-        service_feedback = "\n".join(service_feedback_parts) if service_feedback_parts else "- 서비스 피드백 없음"
+            # 피드백 유형 요약
+            types = []
+            if complaint_items:
+                types.append("불편사항")
+            if suggestion_items:
+                types.append("건의사항")
+            if feedback_items:
+                types.append("일반 피드백")
+            type_str = ", ".join(types)
 
-        # 체크포인트
-        checkpoints = []
-        if complaint_items:
-            checkpoints.append(f"- 서비스 불편사항 {len(complaint_items)}건 접수됨 - 확인 필요")
-        if suggestion_items:
-            checkpoints.append(f"- 서비스 제보/건의 {len(suggestion_items)}건 접수됨")
-        if feedback_items:
-            checkpoints.append(f"- 서비스 피드백 {len(feedback_items)}건 접수됨")
-        checkpoint_str = "\n".join(checkpoints) if checkpoints else "- 특이사항 없음"
+            service_feedback = f"{type_str} 등 서비스 관련 피드백이 {total_feedback}건 접수되었습니다.\n\n> _\"{quote}\"_"
+        else:
+            service_feedback = "- 서비스 관련 피드백 없음"
 
         return {
             "summary": summary,
             "main_content": main_content,
             "service_feedback": service_feedback,
-            "checkpoints": checkpoint_str
         }
 
     def _generate_master_summary(self, master_data: Dict[str, Any]) -> str:
