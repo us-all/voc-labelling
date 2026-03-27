@@ -57,18 +57,52 @@ class WeeklyAnalytics:
             prev_week_counts
         )
 
-        # 카테고리별 통계
+        # 카테고리별 통계 (topic 기반)
         category_stats = self._calculate_category_stats(letters, posts)
 
-        # 서비스 피드백 추출
+        # 서비스 피드백 추출 (topic == "대응 필요")
         service_feedbacks = self._extract_service_feedbacks(letters, posts)
+
+        # 태그 분포
+        tag_stats = self._calculate_tag_stats(letters, posts)
+
+        # 감정 분포
+        sentiment_stats = self._calculate_sentiment_stats(letters, posts)
 
         return {
             "total_stats": total_stats,
             "master_stats": master_stats,
             "category_stats": category_stats,
-            "service_feedbacks": service_feedbacks
+            "service_feedbacks": service_feedbacks,
+            "tag_stats": tag_stats,
+            "sentiment_stats": sentiment_stats,
         }
+
+    def _calculate_tag_stats(
+        self,
+        letters: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]]
+    ) -> Dict[str, int]:
+        """전체 태그 분포 계산"""
+        tag_counts = Counter()
+        for item in letters + posts:
+            tags = item.get("tags", [])
+            if isinstance(tags, list):
+                for tag in tags:
+                    tag_counts[tag] += 1
+        return dict(tag_counts)
+
+    def _calculate_sentiment_stats(
+        self,
+        letters: List[Dict[str, Any]],
+        posts: List[Dict[str, Any]]
+    ) -> Dict[str, int]:
+        """전체 감정 분포 계산"""
+        sentiment_counts = Counter()
+        for item in letters + posts:
+            sentiment = item.get("sentiment", "미분류")
+            sentiment_counts[sentiment] += 1
+        return dict(sentiment_counts)
 
     def _calculate_total_stats(
         self,
@@ -140,16 +174,16 @@ class WeeklyAnalytics:
                     "this_week": {"letters": int, "posts": int, "total": int},
                     "last_week": {"letters": int, "posts": int, "total": int},
                     "change": {"letters": int, "posts": int, "total": int},
-                    "categories": {"감사·후기": int, ...},
+                    "tags": Counter,
                     "contents": [...],
-                    "club_names": set()  # 소속 클럽들
+                    "club_names": set()
                 }
             }
         """
         master_stats = defaultdict(lambda: {
             "this_week": {"letters": 0, "posts": 0, "total": 0},
             "last_week": {"letters": 0, "posts": 0, "total": 0},
-            "categories": defaultdict(int),
+            "tags": Counter(),
             "contents": [],
             "club_names": set()
         })
@@ -168,16 +202,24 @@ class WeeklyAnalytics:
             if club_name:
                 master_stats[master_group]["club_names"].add(club_name)
 
-            # 카테고리 집계
-            category = letter.get("classification", {}).get("category", "미분류")
-            master_stats[master_group]["categories"][category] += 1
+            # 태그 집계
+            item_tags = letter.get("tags", [])
+            if isinstance(item_tags, list):
+                for tag in item_tags:
+                    master_stats[master_group]["tags"][tag] += 1
 
             # 콘텐츠 저장
+            topic = letter.get("topic", "")
+            sentiment = letter.get("sentiment", "")
+            summary = letter.get("summary", "")
             master_stats[master_group]["contents"].append({
                 "type": "letter",
                 "content": clean_text(letter.get("message", ""), 150),
-                "category": category,
-                "createdAt": letter.get("createdAt", ""),
+                "topic": topic,
+                "sentiment": sentiment,
+                "summary": summary,
+                "tags": item_tags if isinstance(item_tags, list) else [],
+                "createdAt": letter.get("createdAt", letter.get("created_at", "")),
                 "masterName": master_name,
                 "masterClubName": club_name
             })
@@ -195,18 +237,26 @@ class WeeklyAnalytics:
             if club_name:
                 master_stats[master_group]["club_names"].add(club_name)
 
-            # 카테고리 집계
-            category = post.get("classification", {}).get("category", "미분류")
-            master_stats[master_group]["categories"][category] += 1
+            # 태그 집계
+            item_tags = post.get("tags", [])
+            if isinstance(item_tags, list):
+                for tag in item_tags:
+                    master_stats[master_group]["tags"][tag] += 1
 
             # 콘텐츠 저장
             content = post.get("textBody") or post.get("body", "")
+            topic = post.get("topic", "")
+            sentiment = post.get("sentiment", "")
+            summary = post.get("summary", "")
             master_stats[master_group]["contents"].append({
                 "type": "post",
                 "content": clean_text(content, 150),
-                "category": category,
+                "topic": topic,
+                "sentiment": sentiment,
+                "summary": summary,
+                "tags": item_tags if isinstance(item_tags, list) else [],
                 "title": post.get("title", ""),
-                "createdAt": post.get("createdAt", ""),
+                "createdAt": post.get("createdAt", post.get("created_at", "")),
                 "masterName": master_name,
                 "masterClubName": club_name
             })
@@ -217,12 +267,12 @@ class WeeklyAnalytics:
             # masterId -> masterName 매핑 생성
             master_id_to_name = {}
             for letter in letters:
-                master_id = letter.get("masterId", "")
+                master_id = letter.get("masterId", "") or letter.get("master_id", "")
                 master_name = letter.get("masterName", "Unknown")
                 if master_id:
                     master_id_to_name[master_id] = self._get_master_group_name(master_name)
             for post in posts:
-                master_id = post.get("postBoardId", "") or post.get("masterId", "")
+                master_id = post.get("postBoardId", "") or post.get("masterId", "") or post.get("master_id", "")
                 master_name = post.get("masterName", "Unknown")
                 if master_id:
                     master_id_to_name[master_id] = self._get_master_group_name(master_name)
@@ -285,20 +335,20 @@ class WeeklyAnalytics:
         posts: List[Dict[str, Any]]
     ) -> Dict[str, int]:
         """
-        카테고리별 통계 계산
+        카테고리별 통계 계산 (topic 필드 기반)
 
         Returns:
-            {"감사·후기": int, "질문·토론": int, ...}
+            {"대응 필요": int, "콘텐츠·투자": int, ...}
         """
         category_counts = Counter()
 
         for letter in letters:
-            category = letter.get("classification", {}).get("category", "미분류")
-            category_counts[category] += 1
+            topic = letter.get("topic", "미분류")
+            category_counts[topic] += 1
 
         for post in posts:
-            category = post.get("classification", {}).get("category", "미분류")
-            category_counts[category] += 1
+            topic = post.get("topic", "미분류")
+            category_counts[topic] += 1
 
         return dict(category_counts)
 
@@ -308,40 +358,39 @@ class WeeklyAnalytics:
         posts: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         """
-        서비스 관련 피드백 추출 (서비스 피드백, 서비스 불편사항, 서비스 제보/건의)
+        서비스 관련 피드백 추출 (topic == "대응 필요")
 
         Returns:
-            [{"content": str, "reason": str, "masterId": str, "subcategory": str}, ...]
+            [{"content": str, "reason": str, "masterId": str}, ...]
         """
-        service_categories = ["서비스 피드백", "서비스 불편사항", "서비스 제보/건의"]
         feedbacks = []
 
         for letter in letters:
-            classification = letter.get("classification", {})
-            category = classification.get("category", "")
-            if category in service_categories:
+            topic = letter.get("topic", "")
+            if topic == "대응 필요":
                 feedbacks.append({
                     "type": "letter",
                     "content": clean_text(letter.get("message", ""), 200),
-                    "reason": classification.get("reason", ""),
-                    "masterId": letter.get("masterId", "unknown"),
-                    "createdAt": letter.get("createdAt", ""),
-                    "subcategory": category
+                    "reason": letter.get("summary", ""),
+                    "masterId": letter.get("masterId", "") or letter.get("master_id", "unknown"),
+                    "createdAt": letter.get("createdAt", letter.get("created_at", "")),
+                    "sentiment": letter.get("sentiment", ""),
+                    "tags": letter.get("tags", []),
                 })
 
         for post in posts:
-            classification = post.get("classification", {})
-            category = classification.get("category", "")
-            if category in service_categories:
+            topic = post.get("topic", "")
+            if topic == "대응 필요":
                 content = post.get("textBody") or post.get("body", "")
                 feedbacks.append({
                     "type": "post",
                     "title": post.get("title", ""),
                     "content": clean_text(content, 200),
-                    "reason": classification.get("reason", ""),
-                    "masterId": post.get("postBoardId", "unknown"),
-                    "createdAt": post.get("createdAt", ""),
-                    "subcategory": category
+                    "reason": post.get("summary", ""),
+                    "masterId": post.get("postBoardId", "") or post.get("masterId", "") or post.get("master_id", "unknown"),
+                    "createdAt": post.get("createdAt", post.get("created_at", "")),
+                    "sentiment": post.get("sentiment", ""),
+                    "tags": post.get("tags", []),
                 })
 
         return feedbacks
@@ -354,12 +403,12 @@ class WeeklyAnalytics:
         limit: int = 5
     ) -> List[Dict[str, Any]]:
         """
-        특정 카테고리의 상위 콘텐츠 추출
+        특정 카테고리(topic)의 상위 콘텐츠 추출
 
         Args:
             letters: 편지글 리스트
             posts: 게시글 리스트
-            category: 카테고리명
+            category: topic명
             limit: 반환할 최대 개수
 
         Returns:
@@ -368,23 +417,23 @@ class WeeklyAnalytics:
         contents = []
 
         for letter in letters:
-            if letter.get("classification", {}).get("category") == category:
+            if letter.get("topic") == category:
                 contents.append({
                     "type": "letter",
                     "content": clean_text(letter.get("message", ""), 200),
-                    "masterId": letter.get("masterId", ""),
-                    "createdAt": letter.get("createdAt", "")
+                    "masterId": letter.get("masterId", "") or letter.get("master_id", ""),
+                    "createdAt": letter.get("createdAt", letter.get("created_at", ""))
                 })
 
         for post in posts:
-            if post.get("classification", {}).get("category") == category:
+            if post.get("topic") == category:
                 content_text = post.get("textBody") or post.get("body", "")
                 contents.append({
                     "type": "post",
                     "title": post.get("title", ""),
                     "content": clean_text(content_text, 200),
-                    "masterId": post.get("postBoardId", ""),
-                    "createdAt": post.get("createdAt", ""),
+                    "masterId": post.get("postBoardId", "") or post.get("master_id", ""),
+                    "createdAt": post.get("createdAt", post.get("created_at", "")),
                     "likeCount": post.get("likeCount", 0),
                     "replyCount": post.get("replyCount", 0)
                 })

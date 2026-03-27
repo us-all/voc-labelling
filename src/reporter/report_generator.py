@@ -1,35 +1,39 @@
 """주간 리포트 생성 모듈"""
 import os
+import json
+import re
 from typing import Dict, Any, List, Tuple
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from openai import OpenAI
+import boto3
 from dotenv import load_dotenv
 from src.utils.text_utils import clean_text
 
 load_dotenv()
 
-# LLM 모델 설정
-DEFAULT_MODEL = "gpt-4o-mini"
-
 
 class ReportGenerator:
     """주간 리포트 생성기"""
 
-    def __init__(self, api_key: str = None, model: str = None):
+    def __init__(self):
         """
-        ReportGenerator 초기화
-
-        Args:
-            api_key: OpenAI API 키
-            model: 사용할 모델명 (기본: gpt-4o-mini)
+        ReportGenerator 초기화 (Bedrock 클라이언트)
         """
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("CALLME_OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("OPENAI_API_KEY 또는 CALLME_OPENAI_API_KEY가 설정되지 않았습니다.")
+        self.bedrock = boto3.client("bedrock-runtime", region_name=os.getenv("AWS_REGION", "us-west-2"))
+        self.model_id = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
 
-        self.model = model or DEFAULT_MODEL
-        self.client = OpenAI(api_key=self.api_key)
+    def _call_llm(self, prompt: str, max_tokens: int = 2000) -> str:
+        """Bedrock Claude API 호출"""
+        resp = self.bedrock.invoke_model(
+            modelId=self.model_id,
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            }),
+        )
+        result = json.loads(resp["body"].read())
+        return result["content"][0]["text"].strip()
 
     def generate_report(
         self,
@@ -91,13 +95,11 @@ class ReportGenerator:
 
 | 카테고리 | 설명 |
 | -------- | ---- |
-| 감사·후기 | 마스터에 대한 피드백 (긍정적/부정적 포함) |
-| 질문·토론 | 포트폴리오, 종목, 투자 전략에 대한 질문 및 토론 |
-| 정보성 글 | 투자 경험 공유, 종목 분석, 뉴스/정보 공유 |
-| 일상·공감 | 안부, 축하, 가입인사, 일상 이야기, 공감 표현 |
-| 서비스 피드백 | 플랫폼/서비스 기능 문의, 일반적인 서비스 관련 질문 |
-| 서비스 불편사항 | 플랫폼 오류, 버그, 장애 등 기술적 문제 제보 |
-| 서비스 제보/건의 | 서비스 개선 제안, 신규 기능 요청 |
+| 운영 피드백 | 결제/환불, 구독/멤버십, 세미나, 가격 정책 등 운영 관련 |
+| 서비스 피드백 | 앱 오류, 결제 오류, 로그인 문제, 기능 개선 요청 등 |
+| 콘텐츠 반응 | 콘텐츠 품질, 마스터 소통/태도, 강의/리포트 반응 |
+| 투자 담론 | 포트폴리오/종목 전략, 시장 전망, 수익/손실, 매매 타이밍 |
+| 기타 | 인사/안부, 축하/격려, 일상 공유 |
 
 ---
 
@@ -172,46 +174,65 @@ class ReportGenerator:
         return summary
 
     def _generate_key_issues(self, stats: Dict[str, Any]) -> str:
-        """LLM API를 사용한 핵심 이슈 3개 생성 (특정 마스터 비특정)"""
+        """LLM API를 사용한 핵심 이슈 3개 생성 (태그 분포 + 요약 샘플 기반, 마스터 비특정)"""
         total = stats["total_stats"]
-        category_stats = stats["category_stats"]
         master_stats = stats["master_stats"]
 
-        # 마스터별 주요 콘텐츠 샘플 수집 (마스터명 제거)
-        all_contents_sample = []
+        # 태그 분포 (stats["tag_stats"]에서 읽기)
+        tag_stats = stats.get("tag_stats", {})
+        tag_lines = [f"- {tag}: {cnt}건" for tag, cnt in sorted(tag_stats.items(), key=lambda x: x[1], reverse=True)[:15]]
+        tag_section = "\n".join(tag_lines) if tag_lines else "태그 데이터 없음"
+
+        # 마스터별 원문 콘텐츠 수집 (부정/긍정 분리, 마스터명 제거)
+        neg_samples = []
+        pos_samples = []
         for master_name, data in sorted(
             master_stats.items(),
             key=lambda x: x[1]["this_week"]["total"],
             reverse=True
-        )[:8]:  # 상위 8개 마스터만
-            for c in data.get("contents", [])[:10]:
-                text = c.get("content", "")
-                cat = c.get("category", "")
-                if text:
-                    all_contents_sample.append(f"[{cat}] {text}")
+        )[:8]:
+            for c in data.get("contents", []):
+                content = c.get("content", "")[:250]
+                tags = c.get("tags", [])
+                tag_str = ",".join(tags[:2]) if tags else ""
+                sentiment = c.get("sentiment", "")
+                if not content:
+                    continue
+                if sentiment == "부정":
+                    neg_samples.append(f"[{tag_str}] {content}")
+                elif sentiment == "긍정":
+                    pos_samples.append(f"[{tag_str}] {content}")
 
-        contents_str = "\n".join(all_contents_sample[:50])
+        neg_str = "\n".join(neg_samples[:25])
+        pos_str = "\n".join(pos_samples[:15])
+
+        # 감정 분포
+        sentiment_stats = stats.get("sentiment_stats", {})
+        sentiment_section = ", ".join([f"{s} {cnt}건" for s, cnt in sentiment_stats.items()])
 
         prompt = f"""다음은 금융 투자 커뮤니티 플랫폼의 이번 주 이용자 반응 데이터입니다.
 
-[전체 통계]
-- 이번 주: 편지 {total['this_week']['letters']}건, 게시글 {total['this_week']['posts']}건
-- 전주: 편지 {total['last_week']['letters']}건, 게시글 {total['last_week']['posts']}건
+[전체 규모] 총 {total['this_week']['total']}건 ({sentiment_section})
 
-[카테고리별 통계]
-{chr(10).join([f"- {cat}: {count}건" for cat, count in category_stats.items()])}
+[세부 태그 분포 Top 15]
+{tag_section}
 
-[이용자 반응 샘플]
-{contents_str}
+[부정 반응 원문 샘플]
+{neg_str}
+
+[긍정 반응 원문 샘플]
+{pos_str}
 
 위 데이터를 바탕으로 핵심 이슈 3개를 작성해주세요.
 
 ## 작성 원칙
+- 세부 태그 분포와 이용자 반응 샘플을 기반으로, 이번 주 실제로 두드러진 구체적 주제를 핵심 이슈로 선정
 - 특정 마스터 이름을 절대 언급하지 말 것. "일부 커뮤니티", "특정 클럽" 등으로 표현
 - 여러 클럽에 걸쳐 나타나는 전반적인 추세와 경향을 중심으로 작성
 - 데이터에 실제로 나온 내용만 언급. 추측이나 해석 금지
-- "커뮤니티 활성화", "소통 강화" 등 추상적·미사여구 표현 금지
+- "커뮤니티 활성화", "소통 강화", "정서적 유대" 등 추상적·미사여구 표현 금지
 - 각 이슈는 제목 + 2-3문장 설명으로 구성
+- ~합니다체로 작성
 
 ## 형식
 반드시 아래 형식으로 작성:
@@ -229,17 +250,7 @@ class ReportGenerator:
 2-3문장 설명."""
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                max_tokens=1500,
-                temperature=0.3,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
-
-            return response.choices[0].message.content.strip()
-
+            return self._call_llm(prompt, max_tokens=1500)
         except Exception as e:
             return f"- 이번 주 전체 이용자 반응 규모는 총 {total['this_week']['total']}건입니다."
 
@@ -353,7 +364,7 @@ class ReportGenerator:
     def _generate_master_insight(self, master_name: str, data: Dict[str, Any], compact: bool = False) -> Dict[str, str]:
         """LLM API로 마스터별 상세 인사이트 생성 (compact=True: 20건 미만 축약 모드)"""
         contents = data.get("contents", [])
-        categories = data.get("categories", {})
+        tags = data.get("tags", {})
         change = data.get("change", {})
 
         # 콘텐츠가 없으면 기본값 반환
@@ -364,38 +375,39 @@ class ReportGenerator:
                 "service_feedback": "- 서비스 피드백이 없습니다.",
             }
 
-        # 일반 콘텐츠와 서비스 관련 콘텐츠 분리
-        general_contents = []
-        feedback_contents = []
-        complaint_contents = []
-        suggestion_contents = []
-        for c in contents:
-            cat = c.get("category", "미분류")
-            text = c.get("content", "")
-            if cat == "서비스 피드백":
-                feedback_contents.append(text)
-            elif cat in ("불편사항", "서비스 불편사항"):
-                complaint_contents.append(text)
-            elif cat == "서비스 제보/건의":
-                suggestion_contents.append(text)
-            else:
-                general_contents.append(f"[{cat}] {text}")
+        # 콘텐츠를 부정/긍정/대응필요로 분리
+        negative_contents = []
+        positive_contents = []
+        neutral_contents = []
+        feedback_contents = []  # topic == "대응 필요"
 
-        # 일반 콘텐츠 (최대 30개)
+        for c in contents:
+            topic = c.get("topic", "")
+            sentiment = c.get("sentiment", "")
+            summary = c.get("summary", "")
+            text = summary or c.get("content", "")
+
+            if topic == "대응 필요":
+                feedback_contents.append(text)
+            elif sentiment == "부정":
+                negative_contents.append(f"[부정] {text}")
+            elif sentiment == "긍정":
+                positive_contents.append(f"[긍정] {text}")
+            else:
+                neutral_contents.append(f"[중립] {text}")
+
+        # 일반 콘텐츠 (긍정 + 중립 + 부정, 최대 30개)
+        general_contents = positive_contents[:15] + neutral_contents[:10] + negative_contents[:5]
         general_str = "\n".join(general_contents[:30])
 
-        # 서비스 피드백 + 불편사항 + 제보/건의 합쳐서 전달
-        all_feedback = []
-        if feedback_contents:
-            all_feedback.extend([f"[서비스 피드백] {fb}" for fb in feedback_contents])
-        if complaint_contents:
-            all_feedback.extend([f"[서비스 불편사항] {cp}" for cp in complaint_contents])
-        if suggestion_contents:
-            all_feedback.extend([f"[서비스 제보/건의] {sg}" for sg in suggestion_contents])
-        feedback_str = "\n".join([f"- {fb}" for fb in all_feedback]) if all_feedback else "없음"
+        # 부정 콘텐츠 별도 표시
+        negative_str = "\n".join([f"- {nc}" for nc in negative_contents[:10]]) if negative_contents else "없음"
 
-        # 카테고리 통계
-        cat_stats = "\n".join([f"- {cat}: {cnt}건" for cat, cnt in categories.items()])
+        # 서비스 피드백 (대응 필요 건)
+        feedback_str = "\n".join([f"- {fb}" for fb in feedback_contents]) if feedback_contents else "없음"
+
+        # 태그 분포
+        tag_stats_str = "\n".join([f"- {tag}: {cnt}건" for tag, cnt in sorted(tags.items(), key=lambda x: x[1], reverse=True)]) if tags else "태그 데이터 없음"
 
         prompt = f"""다음은 금융 투자 커뮤니티 "{master_name}" 마스터의 이번 주 이용자 반응 데이터입니다.
 
@@ -403,16 +415,19 @@ class ReportGenerator:
 - 편지: {data['this_week']['letters']}건 (전주 대비 {change.get('letters', 0):+d})
 - 게시글: {data['this_week']['posts']}건 (전주 대비 {change.get('posts', 0):+d})
 
-[카테고리별 분류]
-{cat_stats}
+[태그 분포]
+{tag_stats_str}
 
-[일반 콘텐츠 샘플]
+[긍정/중립 콘텐츠 샘플]
 {general_str}
 
-[서비스 피드백 및 불편사항]
+[부정 콘텐츠]
+{negative_str}
+
+[대응 필요 건 (서비스 피드백)]
 {feedback_str}
 
-위 데이터를 분석하여 다음 3가지를 작성해주세요.
+위 데이터를 분석하여 다음 3가지를 작성해주세요. ~합니다체로 작성해주세요.
 
 ## 작성 원칙
 - 데이터에 실제로 나온 내용만 언급할 것. 추측이나 해석을 넣지 말 것.
@@ -424,7 +439,7 @@ class ReportGenerator:
 1. **summary**: 한 줄 요약. 데이터에 기반한 팩트 중심으로 작성. (예: "편지 수는 감소했으나, 포트폴리오 구성과 종목 관련 질문이 중심인 주간입니다.")
 
 2. **main_content**: 주요 내용을 테마별로 정리 ({('2개 테마' if compact else '2-4개 테마')})
-   - 서비스 피드백/불편사항/제보 관련 내용은 여기에 넣지 말 것. service_feedback에서 별도로 다룸.
+   - 대응 필요 건(서비스 피드백)은 여기에 넣지 말 것. service_feedback에서 별도로 다룸.
    - 비슷한 내용끼리 묶어서 테마로 구성
    - 각 테마마다 2-3문장으로 충분히 설명하고, 맥락과 배경을 포함할 것
    - 대표 인용문은 가장 핵심적인 원문을 그대로 사용 (긴 인용 OK)
@@ -436,31 +451,20 @@ class ReportGenerator:
 
 
 3. **service_feedback**: 서비스 피드백 (하나의 문자열로 작성)
-   - 서비스 관련 내용이 없으면 "- 서비스 관련 피드백 없음"으로 작성
-   - 있으면 전체 내용을 한 문장으로 요약하고, 대표 인용문 1개만 첨부
-   - 담당자들이 실시간으로 처리한 내용이므로 추이만 간결하게 보여주면 됨
-   - 형식 예시: "VOD 업로드 지연, 결제 오류 등 서비스 관련 피드백이 N건 접수되었습니다.\\n\\n> _\\"인용문\\"_"
+   - 대응 필요 건이 없으면 "- 서비스 관련 피드백 없음"으로 작성
+   - "서비스 피드백이 접수되었습니다" 같은 일반적 문구 금지
+   - 구체적으로 어떤 피드백이 몇 건인지, 내용을 명시할 것
+   - 대표 인용문 1개 첨부
+   - 형식 예시: "오프라인 수업 일정 사전 공지 부재에 대한 불만이 복수 제기됐습니다. 녹화본 재생 중단 현상, 수업 자료(PPT) 제공 요청도 함께 접수됐습니다. (총 N건)\\n\\n> _\\"인용문\\"_"
 
 ## 응답 형식
 반드시 JSON 객체로 응답하되, 모든 값은 문자열(string)이어야 합니다. 리스트나 배열을 사용하지 마세요.
 {{"summary": "문자열", "main_content": "문자열", "service_feedback": "문자열"}}"""
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                max_tokens=3000,
-                temperature=0.3,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
-
-            response_text = response.choices[0].message.content.strip()
+            response_text = self._call_llm(prompt, max_tokens=3000)
 
             # JSON 파싱
-            import json
-            import re
-
             # JSON 블록 추출
             json_match = re.search(r'\{[\s\S]*\}', response_text)
             if json_match:
@@ -510,12 +514,12 @@ class ReportGenerator:
 
     def _generate_fallback_insight(self, data: Dict[str, Any]) -> Dict[str, str]:
         """API 실패 시 기본 인사이트 생성 (라벨링 데이터 활용)"""
-        categories = data.get("categories", {})
+        tags = data.get("tags", {})
         contents = data.get("contents", [])
         change = data.get("change", {})
 
-        # 가장 많은 카테고리
-        top_category = max(categories.items(), key=lambda x: x[1])[0] if categories else "미분류"
+        # 가장 많은 태그
+        top_tag = max(tags.items(), key=lambda x: x[1])[0] if tags else "미분류"
 
         # 증감 트렌드
         if change.get("total", 0) > 0:
@@ -525,74 +529,53 @@ class ReportGenerator:
         else:
             trend = "유지"
 
-        summary = f"전체 규모는 {trend}했으며, {top_category} 중심의 주간입니다."
+        summary = f"전체 규모는 {trend}했으며, {top_tag} 중심의 주간입니다."
 
-        # 카테고리별로 콘텐츠 그룹핑
-        service_categories = ["서비스 피드백", "서비스 불편사항", "서비스 제보/건의", "불편사항"]
-        category_contents = {}
+        # 태그별로 콘텐츠 그룹핑
+        tag_contents = {}
         for c in contents:
-            cat = c.get("category", "미분류")
-            if cat not in service_categories:
-                if cat not in category_contents:
-                    category_contents[cat] = []
-                category_contents[cat].append(c.get("content", ""))
+            topic = c.get("topic", "")
+            if topic != "대응 필요":
+                content_tags = c.get("tags", [])
+                for tag in content_tags:
+                    if tag not in tag_contents:
+                        tag_contents[tag] = []
+                    tag_contents[tag].append(c.get("content", ""))
 
         # 주요 내용을 테마 형식으로
         main_parts = []
         theme_num = 1
-        for cat, cnt in sorted(categories.items(), key=lambda x: x[1], reverse=True):
-            if cat in service_categories:
-                continue
+        for tag, cnt in sorted(tags.items(), key=lambda x: x[1], reverse=True):
             if cnt < 3:  # 3건 미만은 스킵
                 continue
             if theme_num > 3:  # 최대 3개 테마
                 break
 
-            main_parts.append(f"**{theme_num}. {cat} ({cnt}건)**\n")
+            main_parts.append(f"**{theme_num}. {tag} ({cnt}건)**\n")
 
-            # 해당 카테고리의 대표 인용문
-            cat_texts = category_contents.get(cat, [])
-            if cat_texts:
-                sample = cat_texts[0][:150]
-                main_parts.append(f"> _\"{sample}{'...' if len(cat_texts[0]) > 150 else ''}\"_\n\n")
+            # 해당 태그의 대표 인용문
+            tag_texts = tag_contents.get(tag, [])
+            if tag_texts:
+                sample = tag_texts[0][:150]
+                main_parts.append(f"> _\"{sample}{'...' if len(tag_texts[0]) > 150 else ''}\"_\n\n")
 
             theme_num += 1
 
         main_content = "\n".join(main_parts) if main_parts else "- 분석 데이터 부족"
 
-        # 서비스 피드백, 불편사항, 제보/건의 추출
+        # 서비스 피드백 (대응 필요 건)
         feedback_items = []
-        complaint_items = []
-        suggestion_items = []
         for c in contents:
-            cat = c.get("category", "")
+            topic = c.get("topic", "")
             text = c.get("content", "")
-            if cat == "서비스 피드백" and text:
+            if topic == "대응 필요" and text:
                 feedback_items.append(text)
-            elif cat in ("불편사항", "서비스 불편사항") and text:
-                complaint_items.append(text)
-            elif cat == "서비스 제보/건의" and text:
-                suggestion_items.append(text)
 
-        # 서비스 피드백: 한 문장 요약 + 인용구 1개
-        total_feedback = len(complaint_items) + len(suggestion_items) + len(feedback_items)
-        if total_feedback > 0:
-            # 대표 인용문 1개 선택 (불편사항 우선)
-            representative = (complaint_items or suggestion_items or feedback_items)[0]
+        if feedback_items:
+            representative = feedback_items[0]
             sample = representative[:120]
             quote = f"{sample}{'...' if len(representative) > 120 else ''}"
-
-            # 피드백 유형 요약
-            types = []
-            if complaint_items:
-                types.append("불편사항")
-            if suggestion_items:
-                types.append("건의사항")
-            if feedback_items:
-                types.append("일반 피드백")
-            type_str = ", ".join(types)
-
-            service_feedback = f"{type_str} 등 서비스 관련 피드백이 {total_feedback}건 접수되었습니다.\n\n> _\"{quote}\"_"
+            service_feedback = f"대응 필요 건이 {len(feedback_items)}건 접수되었습니다.\n\n> _\"{quote}\"_"
         else:
             service_feedback = "- 서비스 관련 피드백 없음"
 
@@ -604,8 +587,8 @@ class ReportGenerator:
 
     def _generate_master_summary(self, master_data: Dict[str, Any]) -> str:
         """마스터별 요약 문구 생성"""
-        categories = master_data["categories"]
-        top_category = max(categories.items(), key=lambda x: x[1])[0] if categories else "없음"
+        tags = master_data.get("tags", {})
+        top_tag = max(tags.items(), key=lambda x: x[1])[0] if tags else "없음"
 
         change_total = master_data["change"]["total"]
 
@@ -616,7 +599,7 @@ class ReportGenerator:
         else:
             trend = "유지"
 
-        return f"{trend} 추세이며, {top_category} 중심의 주간입니다."
+        return f"{trend} 추세이며, {top_tag} 중심의 주간입니다."
 
     def _generate_service_feedback_summary(self, stats: Dict[str, Any]) -> str:
         """서비스 피드백 요약 생성"""
