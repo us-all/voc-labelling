@@ -19,12 +19,16 @@ load_dotenv()
 
 from src.bigquery.client import BigQueryClient
 from src.bigquery.queries import WeeklyDataQuery
+from src.bigquery.writer import BigQueryWriter
 from src.classifier_v5.classifier import V5Classifier
 from src.classifier_v5.bedrock_classifier import BedrockV5Classifier
 from src.reporter.analytics import WeeklyAnalytics
 from src.reporter.report_generator import ReportGenerator
 from src.reporter.feedback_clusterer import cluster_feedbacks, enrich_master_stats_with_clusters
 from src.reporter.tone_reviewer import review_report
+from src.integrations.notion_client import NotionReportClient
+from src.integrations.slack_client import SlackNotifier
+from src.utils.excel_exporter import export_to_excel
 
 
 def classify_items(items, content_field, classifier):
@@ -53,6 +57,7 @@ def main():
     parser.add_argument("--end", help="종료일 (YYYY-MM-DD)")
     parser.add_argument("--workers", type=int, default=10)
     parser.add_argument("--bedrock", action="store_true", help="Bedrock Haiku 사용 (Anthropic API 대신)")
+    parser.add_argument("--no-upload", action="store_true", help="Notion/Slack 업로드 건너뛰기")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -103,6 +108,46 @@ def main():
     elapsed = time.time() - start_time
     print(f"    분류 완료: {cost['total_items']}건, {elapsed:.1f}초, ${cost['cost_usd']}")
 
+    # 2-1. 분류 결과 JSON 저장 (로컬 캐시)
+    import json
+    data_dir = os.path.join(os.path.dirname(__file__), "..", "data", "classified_data")
+    os.makedirs(data_dir, exist_ok=True)
+    classified_path = os.path.join(data_dir, f"v5_{start_date}.json")
+    with open(classified_path, "w", encoding="utf-8") as f:
+        json.dump({"letters": letters, "posts": posts}, f, ensure_ascii=False, default=str)
+    print(f"    로컬 저장: {classified_path}")
+
+    # 2-2. BigQuery voc_labelled.letters_posts 저장 (일간 파이프라인과 동일 테이블)
+    # pipeline_date는 각 item의 KST 생성일 기준으로 그룹핑 후 day별 upsert
+    print(f"\n  Phase 2-2: BigQuery voc_labelled 저장")
+    writer = BigQueryWriter(bq_client.client)
+    all_items = letters + posts
+
+    from collections import defaultdict
+    from datetime import datetime as _dt, timedelta as _td
+    items_by_date = defaultdict(list)
+    for item in all_items:
+        created = item.get("createdAt", "")
+        if not created:
+            continue
+        # createdAt은 UTC ISO 문자열 → KST 날짜로 변환
+        try:
+            if isinstance(created, str):
+                utc_dt = _dt.fromisoformat(created.replace("Z", "+00:00"))
+            else:
+                utc_dt = created
+            kst_date = (utc_dt + _td(hours=9)).strftime("%Y-%m-%d")
+            items_by_date[kst_date].append(item)
+        except Exception:
+            pass
+
+    total_written = 0
+    for pipeline_date, day_items in sorted(items_by_date.items()):
+        n = writer.write_letters_posts(day_items, pipeline_date, classifier_model="bedrock-haiku-3.5-v5")
+        total_written += n
+        print(f"    {pipeline_date}: {n}건")
+    print(f"    총 {total_written}건 저장 완료")
+
     # 3. 전주 데이터 (건수 비교용 — 분류 불필요)
     print(f"\n  Phase 3: 전주 건수 조회")
     from datetime import datetime, timedelta
@@ -122,7 +167,7 @@ def main():
             item["masterName"] = master_info[mid].get("displayName") or master_info[mid].get("name", "Unknown")
         else:
             item["masterName"] = "Unknown"
-    board_query_sql = f"SELECT _id as boardId, masterId FROM `{bq_client.project_id}.us_plus_new.postboards`"
+    board_query_sql = f"SELECT _id as boardId, masterId FROM `{bq_client.project_id}.us_plus_next.postboards`"
     board_to_master = {b["boardId"]: b["masterId"] for b in bq_client.execute_query(board_query_sql)}
     for item in prev_posts:
         bid = item.get("postBoardId", "")
@@ -192,6 +237,69 @@ def main():
     total_cost = classifier.get_cost_report()
     print(f"\n  저장: {output_path}")
     print(f"  총 비용: ${total_cost['cost_usd']}")
+
+    # Phase 6: 엑셀 생성
+    print(f"\n  Phase 6: 엑셀 파일 생성")
+    excel_path = os.path.join(output_dir, f"weekly_data_{start_date}.xlsx")
+    export_to_excel(letters, posts, excel_path)
+    print(f"    저장: {excel_path}")
+
+    # Phase 7: Notion + Slack 업로드
+    if args.no_upload:
+        print(f"\n  Phase 7: 업로드 건너뜀 (--no-upload)")
+    else:
+        print(f"\n  Phase 7: Notion 업로드")
+        notion_url = None
+        try:
+            from datetime import datetime, timedelta
+            notion_client = NotionReportClient()
+            start_formatted = datetime.strptime(start_date, '%Y-%m-%d').strftime('%Y.%m.%d')
+            end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+            end_formatted = (end_dt - timedelta(days=1)).strftime('%m.%d')
+            page_title = f"이용자 반응 리포트 ({start_formatted} ~ {end_formatted})"
+            page_info = notion_client.create_report_page(
+                title=page_title,
+                markdown_content=report,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            notion_url = page_info["url"]
+            print(f"    Notion URL: {notion_url}")
+        except Exception as e:
+            print(f"    ⚠️  Notion 업로드 실패: {e}")
+
+        print(f"\n  Phase 8: Slack 알림")
+        if notion_url:
+            try:
+                slack_client = SlackNotifier()
+                week_label = SlackNotifier.get_week_label(start_date)
+                result = slack_client.send_report_notification(
+                    week_label=week_label,
+                    start_date=start_date,
+                    end_date=end_date,
+                    notion_url=notion_url,
+                )
+                if result.get("ok"):
+                    print(f"    Slack 알림 전송 완료")
+                    message_ts = result.get("message_ts")
+                    if message_ts and os.path.exists(excel_path):
+                        file_result = slack_client.upload_file_to_thread(
+                            file_path=excel_path,
+                            thread_ts=message_ts,
+                            title=f"원본 데이터 ({start_date})",
+                            comment="📎 라벨링된 원본 데이터 파일입니다.",
+                        )
+                        if file_result.get("ok"):
+                            print(f"    엑셀 파일 업로드 완료")
+                        else:
+                            print(f"    ⚠️  엑셀 업로드 실패: {file_result.get('error')}")
+                else:
+                    print(f"    ⚠️  Slack 알림 실패: {result.get('error')}")
+            except Exception as e:
+                print(f"    ⚠️  Slack 알림 실패: {e}")
+        else:
+            print(f"    Notion URL 없음 — Slack 알림 건너뜀")
+
     print(f"\n{'='*60}")
     print(f"  완료!")
     print(f"{'='*60}")
