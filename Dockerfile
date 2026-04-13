@@ -24,6 +24,8 @@ COPY models/channel_3class/kcelectra-base-v2022-v9-boost/final_model/ models/cha
 
 EXPOSE 8502
 
-# 기본 entrypoint: 파이프라인
-# 대시보드: docker run ... streamlit run dashboard/demo_app.py
-ENTRYPOINT ["python", "scripts/run_daily_pipeline.py"]
+# Cloud Run Jobs 에서 args 오버라이드로 실행 대상 선택:
+#   daily  : ["scripts/run_daily_pipeline.py"]
+#   weekly : ["scripts/generate_weekly_report_v5.py"]
+ENTRYPOINT ["python"]
+CMD ["scripts/run_daily_pipeline.py"]

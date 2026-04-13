@@ -1,0 +1,34 @@
+# 이미지 빌드 + Artifact Registry 푸시
+# 사용: gcloud builds submit --config=deploy/cloudbuild.yaml .
+#
+# 필요 변수 (gcloud config 또는 --substitutions 로 전달):
+#   _REGION       = asia-northeast3 (서울)
+#   _REPOSITORY   = voc-pipeline
+#   _IMAGE_NAME   = voc-pipeline
+substitutions:
+  _REGION: asia-northeast3
+  _REPOSITORY: voc-pipeline
+  _IMAGE_NAME: voc-pipeline
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:${SHORT_SHA}
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:latest
+      - .
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}
+
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:${SHORT_SHA}
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE_NAME}:latest
+
+options:
+  machineType: E2_HIGHCPU_8   # KcELECTRA 모델 포함으로 이미지 크기 큼
+  logging: CLOUD_LOGGING_ONLY
