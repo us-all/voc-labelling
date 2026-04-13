@@ -64,6 +64,6 @@
 
 ## 다음 단계 (별도 phase)
 
-- [ ] **Phase 4-1**: 일간 완료 Slack 모니터링 메시지 (대시보드 URL + 부정 요약)
-- [ ] **Phase 4-2**: 일간 실패 Slack 알림 (sanity check fail 시 주간이 막힘)
+- [x] **Phase 4-1**: 일간 완료 Slack 모니터링 메시지 (대시보드 URL + 부정 요약)
+- [x] **Phase 4-2**: 일간 실패 Slack 알림 (sanity check fail 시 주간이 막힘)
 - [ ] **Phase 5**: `cluster_tech_issues.py` voc_labelled 읽기로 전환 (분기 분석 시점에)

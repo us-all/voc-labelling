@@ -156,6 +156,39 @@ def send_daily_summary(items, channel_items, pipeline_date, cost_usd):
         logger.warning(f"일일 요약 Slack 발송 실패: {e}")
 
 
+def send_failure_alert(error: Exception, pipeline_date: str, phase: str = ""):
+    """파이프라인 실패 시 Slack 즉시 알림 — 다음 날 주간 리포트가 막히지 않도록 빠른 인지."""
+    try:
+        from src.integrations.slack_client import SlackNotifier
+        slack = SlackNotifier()
+    except Exception:
+        logger.warning("Slack 연동 실패 — 실패 알림 건너뜀")
+        return
+
+    import traceback
+    tb = traceback.format_exc()
+    # 가장 최근 traceback 라인 5줄만 (메시지가 너무 길어지지 않게)
+    tb_tail = "\n".join(tb.splitlines()[-8:])
+
+    parts = [
+        f"🛑 *VOC 일간 파이프라인 실패 — {pipeline_date}*",
+        "",
+        f"*단계*: {phase or '미상'}",
+        f"*에러*: `{type(error).__name__}: {str(error)[:300]}`",
+        "",
+        "```",
+        tb_tail,
+        "```",
+        "",
+        "_Cloud Run 로그 확인 필요. 이번 주 주간 리포트가 막힐 수 있음 (sanity check fail)._",
+    ]
+    try:
+        slack._send_message("\n".join(parts))
+        logger.info("실패 알림 Slack 발송 완료")
+    except Exception as e:
+        logger.warning(f"실패 알림 Slack 발송도 실패: {e}")
+
+
 def send_slack_alert(items, pipeline_date):
     """부정 급증 시 Slack 알림 (별도 채널/스레드 — 일일 요약과 분리)"""
     try:
@@ -216,7 +249,21 @@ def main():
     logger.info(f"대상 날짜: {target_date}")
     pipeline_start = time.time()
 
+    # 현재 단계 추적 (실패 시 알림에 포함)
+    current_phase = ["init"]
+
+    try:
+        _run_pipeline(args, target_date, next_date, current_phase, pipeline_start)
+    except Exception as e:
+        logger.exception(f"파이프라인 실패 (단계: {current_phase[0]})")
+        if not args.skip_slack:
+            send_failure_alert(e, target_date, current_phase[0])
+        raise   # Cloud Run 이 실패로 인지하도록 재발생
+
+
+def _run_pipeline(args, target_date, next_date, current_phase, pipeline_start):
     # ── Phase 1: BigQuery 데이터 조회 ──
+    current_phase[0] = "Phase 1: BigQuery 조회"
     logger.info("Phase 1: BigQuery 조회")
     bq_client = BigQueryClient()
     query = WeeklyDataQuery(bq_client)
@@ -242,6 +289,7 @@ def main():
         logger.info(f"  [DRY RUN] 편지 {len(letters)}건, 게시글 {len(posts)}건으로 제한")
 
     # ── Phase 2: 편지글/게시글 분류 (Bedrock Sonnet) ──
+    current_phase[0] = "Phase 2: 편지/게시글 분류"
     logger.info("Phase 2: 편지글/게시글 분류 (Bedrock Sonnet v5 4분류)")
     classifier = BedrockV5Classifier(max_workers=args.workers)
 
@@ -262,6 +310,7 @@ def main():
     # ── Phase 3: 채널톡 분류 (KcELECTRA + Bedrock) ──
     channel_items = []
     if not args.skip_channel:
+        current_phase[0] = "Phase 3: 채널톡 분류"
         logger.info("Phase 3: 채널톡 분류 (KcELECTRA + Bedrock)")
         try:
             from src.classifier_v4.bedrock_two_depth import BedrockTwoDepthClassifier
@@ -290,6 +339,7 @@ def main():
             logger.warning(f"  KcELECTRA 로드 실패: {e}")
 
     # ── Phase 4: BigQuery 저장 ──
+    current_phase[0] = "Phase 4: BigQuery 저장"
     logger.info("Phase 4: BigQuery voc_labelled 저장")
     writer = BigQueryWriter(bq_client.client)
 
@@ -300,6 +350,7 @@ def main():
 
     # ── Phase 5: Slack 일일 요약 (부정 급증 정보 포함) ──
     if not args.skip_slack and all_items:
+        current_phase[0] = "Phase 5: Slack 일일 요약"
         logger.info("Phase 5: Slack 일일 요약")
         send_daily_summary(all_items, channel_items, target_date, cost.get("cost_usd", 0.0))
 
