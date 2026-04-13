@@ -24,6 +24,13 @@ SLACK_CHANNEL_ID=slack-channel-id:latest"
 
 COMMON_ENV="BIGQUERY_PROJECT_ID=${PROJECT_ID},PYTHONUNBUFFERED=1"
 
+# 대시보드 URL (deploy_dashboard.sh 실행 후 출력된 URL 을 여기에 채우거나, 환경변수로 전달)
+# 일일 요약 Slack 메시지에 포함됨. 비어있으면 메시지에서 생략.
+DASHBOARD_URL_VAR="${DASHBOARD_URL:-}"
+if [[ -n "${DASHBOARD_URL_VAR}" ]]; then
+    COMMON_ENV="${COMMON_ENV},DASHBOARD_URL=${DASHBOARD_URL_VAR}"
+fi
+
 # ── Job 1: 일간 파이프라인 (편지/게시글 + 채널톡 KcELECTRA) ──
 echo ">> voc-daily Cloud Run Job 생성/업데이트"
 gcloud run jobs deploy voc-daily \

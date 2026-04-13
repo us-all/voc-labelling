@@ -65,8 +65,99 @@ def enrich_master_info(items, master_info, field="masterId"):
     return items
 
 
+def send_daily_summary(items, channel_items, pipeline_date, cost_usd):
+    """매일 분류 완료 시 요약 메시지 — 부정 급증이 없어도 항상 발송.
+
+    역할:
+    1. "오늘 일간 파이프라인이 정상 완료됨" 시그널 (없으면 사람이 인지해야 함)
+    2. 요약 정보 (건수/감정 분포/토픽 Top) — 매일 보는 화면
+    3. 대시보드 URL (DASHBOARD_URL 환경변수)
+    """
+    try:
+        from src.integrations.slack_client import SlackNotifier
+        slack = SlackNotifier()
+    except Exception:
+        logger.warning("Slack 연동 실패 — 일일 요약 건너뜀")
+        return
+
+    lp_total = len(items)
+    letter_n = sum(1 for it in items if "message" in it)
+    post_n = lp_total - letter_n
+    ch_total = len(channel_items) if channel_items else 0
+
+    # 편지/게시글 감정 분포
+    sentiment_counts = {"긍정": 0, "중립": 0, "부정": 0}
+    topic_counts = {}
+    for it in items:
+        cls = it.get("classification", {})
+        s = cls.get("sentiment") or "중립"
+        if s in sentiment_counts:
+            sentiment_counts[s] += 1
+        t = cls.get("topic") or "기타"
+        topic_counts[t] = topic_counts.get(t, 0) + 1
+
+    sent_pct = {k: (v / lp_total * 100 if lp_total else 0) for k, v in sentiment_counts.items()}
+
+    # 부정 급증 마스터 (5건+ & 30%+)
+    master_stats = {}
+    for item in items:
+        master = re.sub(r"\d+$", "", item.get("masterName", "Unknown")).strip()
+        cls = item.get("classification", {})
+        master_stats.setdefault(master, {"total": 0, "neg": 0})
+        master_stats[master]["total"] += 1
+        if cls.get("sentiment") == "부정":
+            master_stats[master]["neg"] += 1
+    neg_alerts = []
+    for master, st in master_stats.items():
+        if st["total"] >= 5 and st["neg"] / st["total"] >= 0.3:
+            neg_alerts.append((master, st["neg"], st["total"], st["neg"] / st["total"] * 100))
+    neg_alerts.sort(key=lambda x: -x[3])
+
+    # 메시지 조립
+    parts = [f"📊 *VOC 일간 요약 — {pipeline_date}*", ""]
+    parts.append(f"*편지/게시글*: {lp_total}건 (편지 {letter_n}, 게시글 {post_n})")
+    if ch_total:
+        parts.append(f"*채널톡*: {ch_total:,}건")
+    parts.append("")
+
+    if lp_total:
+        parts.append("*감정 분포*")
+        parts.append(f"🟢 긍정 {sentiment_counts['긍정']}건 ({sent_pct['긍정']:.0f}%)")
+        parts.append(f"⚪ 중립 {sentiment_counts['중립']}건 ({sent_pct['중립']:.0f}%)")
+        parts.append(f"🔴 부정 {sentiment_counts['부정']}건 ({sent_pct['부정']:.0f}%)")
+        parts.append("")
+
+    if topic_counts:
+        top3 = sorted(topic_counts.items(), key=lambda x: -x[1])[:4]
+        parts.append("*토픽 Top*")
+        for t, n in top3:
+            parts.append(f"• {t} {n}건")
+        parts.append("")
+
+    if neg_alerts:
+        parts.append(f"⚠️ *부정 급증 마스터* ({len(neg_alerts)}명)")
+        for master, neg, total, pct in neg_alerts[:5]:
+            parts.append(f"• *{master}*: {neg}/{total}건 ({pct:.0f}%)")
+        if len(neg_alerts) > 5:
+            parts.append(f"• ... 외 {len(neg_alerts) - 5}명")
+        parts.append("")
+
+    dashboard_url = os.getenv("DASHBOARD_URL", "")
+    if dashboard_url:
+        parts.append(f"📊 대시보드: {dashboard_url}")
+
+    parts.append(f"_(분류 비용 ${cost_usd:.2f})_")
+
+    msg = "\n".join(parts)
+    try:
+        slack._send_message(msg)
+        logger.info("일일 요약 Slack 발송 완료")
+    except Exception as e:
+        logger.warning(f"일일 요약 Slack 발송 실패: {e}")
+
+
 def send_slack_alert(items, pipeline_date):
-    """부정 급증 시 Slack 알림"""
+    """부정 급증 시 Slack 알림 (별도 채널/스레드 — 일일 요약과 분리)"""
     try:
         from src.integrations.slack_client import SlackNotifier
         slack = SlackNotifier()
@@ -207,10 +298,10 @@ def main():
     if channel_items:
         ch_count = writer.write_channel_talk(channel_items, target_date)
 
-    # ── Phase 5: Slack 알림 ──
+    # ── Phase 5: Slack 일일 요약 (부정 급증 정보 포함) ──
     if not args.skip_slack and all_items:
-        logger.info("Phase 5: Slack 알림 체크")
-        send_slack_alert(all_items, target_date)
+        logger.info("Phase 5: Slack 일일 요약")
+        send_daily_summary(all_items, channel_items, target_date, cost.get("cost_usd", 0.0))
 
     # ── 완료 ──
     elapsed = time.time() - pipeline_start
