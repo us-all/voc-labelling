@@ -26,6 +26,7 @@ from src.reporter.analytics import WeeklyAnalytics
 from src.reporter.report_generator import ReportGenerator
 from src.reporter.feedback_clusterer import cluster_feedbacks, enrich_master_stats_with_clusters
 from src.reporter.tone_reviewer import review_report
+from src.reporter.quote_reviewer import review_quotes_in_report
 from src.reporter.sanity_check import check_data_health
 from src.integrations.notion_client import NotionReportClient
 from src.integrations.slack_client import SlackNotifier
@@ -247,6 +248,22 @@ def main():
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(fixed_report)
         report = fixed_report
+
+    # 5-2. 인용구 검수 (욕설/인신공격/사기 단정 자동 제거)
+    print(f"\n  Phase 5-2: 인용구 검수")
+    cleaned_report, quote_audit = review_quotes_in_report(report)
+    print(f"    인용구 {quote_audit['total_quotes']}개 / 제거 {quote_audit['removed_count']}개")
+    for r in quote_audit["removed"]:
+        print(f"    [REMOVED] \"{r['text'][:60]}{'...' if len(r['text']) > 60 else ''}\"")
+        print(f"              사유: {r['reason']}")
+    # 감사 로그 저장
+    import json as _json
+    with open(run_logger.path_for("quote_audit.json"), "w", encoding="utf-8") as f:
+        _json.dump(quote_audit, f, ensure_ascii=False, indent=2)
+    if quote_audit["removed_count"] > 0:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(cleaned_report)
+        report = cleaned_report
 
     total_cost = classifier.get_cost_report()
     run_logger.save_cost(total_cost)
