@@ -26,9 +26,11 @@ from src.reporter.analytics import WeeklyAnalytics
 from src.reporter.report_generator import ReportGenerator
 from src.reporter.feedback_clusterer import cluster_feedbacks, enrich_master_stats_with_clusters
 from src.reporter.tone_reviewer import review_report
+from src.reporter.sanity_check import check_data_health
 from src.integrations.notion_client import NotionReportClient
 from src.integrations.slack_client import SlackNotifier
 from src.utils.excel_exporter import export_to_excel
+from src.utils.run_logger import RunLogger
 
 
 def classify_items(items, content_field, classifier):
@@ -58,6 +60,7 @@ def main():
     parser.add_argument("--workers", type=int, default=10)
     parser.add_argument("--bedrock", action="store_true", help="Bedrock Haiku 사용 (Anthropic API 대신)")
     parser.add_argument("--no-upload", action="store_true", help="Notion/Slack 업로드 건너뛰기")
+    parser.add_argument("--force", action="store_true", help="건전성 체크 fail이어도 강제 진행")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -75,6 +78,9 @@ def main():
         start_date, end_date = WeeklyDataQuery.get_last_week_range()
 
     print(f"\n  대상 기간: {start_date} ~ {end_date}")
+
+    run_logger = RunLogger(start_date)
+    run_logger.log(f"=== 주간 리포트 시작 ({start_date} ~ {end_date}) ===", also_print=False)
 
     # 1. 원본 데이터 조회
     print(f"\n  Phase 1: BigQuery 원본 조회")
@@ -94,6 +100,45 @@ def main():
             item["masterName"] = master_info[mid].get("displayName") or master_info[mid].get("name", "Unknown")
 
     print(f"    편지 {len(letters)}건, 게시글 {len(posts)}건")
+    run_logger.log(f"Phase 1: 편지 {len(letters)}건, 게시글 {len(posts)}건", also_print=False)
+
+    # 1-1. 전주 데이터 조회 (sanity check 입력용 — 분류 전에 가져옴)
+    from datetime import datetime, timedelta
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    prev_start = (start_dt - timedelta(days=7)).strftime("%Y-%m-%d")
+    prev_end = start_date
+    print(f"\n  Phase 1-1: 전주 건수 조회 ({prev_start} ~ {prev_end})")
+    prev_data = query.get_weekly_data(prev_start, prev_end)
+    prev_letters = prev_data["letters"]
+    prev_posts = prev_data["posts"]
+    for item in prev_letters:
+        mid = item.get("masterId", "")
+        item["masterName"] = master_info.get(mid, {}).get("displayName", "Unknown")
+    board_query_sql = f"SELECT _id as boardId, masterId FROM `{bq_client.project_id}.us_plus_next.postboards`"
+    board_to_master = {b["boardId"]: b["masterId"] for b in bq_client.execute_query(board_query_sql)}
+    for item in prev_posts:
+        bid = item.get("postBoardId", "")
+        mid = board_to_master.get(bid, bid)
+        item["masterName"] = master_info.get(mid, {}).get("displayName", "Unknown")
+    print(f"    전주: 편지 {len(prev_letters)}건, 게시글 {len(prev_posts)}건")
+
+    # 1-2. 데이터 건전성 체크 ($21 분류 전에 잡아냄)
+    print(f"\n  Phase 1-2: 데이터 건전성 체크")
+    sanity = check_data_health(letters, posts, prev_letters, prev_posts, start_date, end_date)
+    run_logger.save_anomalies(sanity.to_dict())
+    print(f"    상태: {sanity.status.upper()} ({len(sanity.anomalies)}개 이상)")
+    for a in sanity.anomalies:
+        print(f"    [{a.severity}] {a.code}: {a.message}")
+    run_logger.log(f"Phase 1-2: sanity={sanity.status}, anomalies={len(sanity.anomalies)}", also_print=False)
+
+    if not sanity.should_continue:
+        if args.force:
+            print(f"\n  ⚠️  fail 이지만 --force 로 강제 진행")
+            run_logger.log("fail 무시 (--force)", also_print=False)
+        else:
+            print(f"\n  🛑 건전성 체크 실패 — 발행 중단. 강제 진행은 --force 사용.")
+            print(f"     로그: {run_logger.run_dir}/")
+            return
 
     # 2. v5 분류
     print(f"\n  Phase 2: v5 4분류 (Bedrock Haiku)")
@@ -148,41 +193,10 @@ def main():
         print(f"    {pipeline_date}: {n}건")
     print(f"    총 {total_written}건 저장 완료")
 
-    # 3. 전주 데이터 (건수 비교용 — 분류 불필요)
-    print(f"\n  Phase 3: 전주 건수 조회")
-    from datetime import datetime, timedelta
-    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-    prev_start = (start_dt - timedelta(days=7)).strftime("%Y-%m-%d")
-    prev_end = start_date
-    print(f"    전주 기간: {prev_start} ~ {prev_end}")
-
-    prev_data = query.get_weekly_data(prev_start, prev_end)
-    prev_letters = prev_data["letters"]
-    prev_posts = prev_data["posts"]
-
-    # 전주 마스터 매핑 (count 비교용)
-    for item in prev_letters:
-        mid = item.get("masterId", "")
-        if mid in master_info:
-            item["masterName"] = master_info[mid].get("displayName") or master_info[mid].get("name", "Unknown")
-        else:
-            item["masterName"] = "Unknown"
-    board_query_sql = f"SELECT _id as boardId, masterId FROM `{bq_client.project_id}.us_plus_next.postboards`"
-    board_to_master = {b["boardId"]: b["masterId"] for b in bq_client.execute_query(board_query_sql)}
-    for item in prev_posts:
-        bid = item.get("postBoardId", "")
-        mid = board_to_master.get(bid, bid)
-        if mid in master_info:
-            item["masterName"] = master_info[mid].get("displayName") or master_info[mid].get("name", "Unknown")
-        else:
-            item["masterName"] = "Unknown"
-
-    if prev_letters or prev_posts:
-        print(f"    전주: 편지 {len(prev_letters)}건, 게시글 {len(prev_posts)}건 (건수만 사용)")
-    else:
+    # (전주 데이터는 Phase 1-1 에서 이미 로드됨 — 건전성 체크용으로 미리 가져옴)
+    if not prev_letters and not prev_posts:
         prev_letters = None
         prev_posts = None
-        print(f"    전주 데이터 없음")
 
     # 4. 통계 분석
     print(f"\n  Phase 4: 통계 분석")
@@ -235,8 +249,10 @@ def main():
         report = fixed_report
 
     total_cost = classifier.get_cost_report()
+    run_logger.save_cost(total_cost)
     print(f"\n  저장: {output_path}")
     print(f"  총 비용: ${total_cost['cost_usd']}")
+    print(f"  실행 로그: {run_logger.run_dir}/")
 
     # Phase 6: 엑셀 생성
     print(f"\n  Phase 6: 엑셀 파일 생성")
