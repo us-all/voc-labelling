@@ -90,15 +90,21 @@ def _set_column_widths(worksheet, df: pd.DataFrame):
         worksheet.column_dimensions[col_letter].width = width
 
 
-def _format_date(date_str: str) -> str:
-    """날짜 포맷 변환"""
+def _format_date(date_str) -> str:
+    """날짜 포맷 변환 (str 또는 datetime 모두 처리)"""
     if not date_str:
         return ""
+    # datetime/Timestamp 객체는 문자열로 변환 (tz 제거)
+    if hasattr(date_str, "strftime"):
+        # KST 변환이 필요하면 호출부에서 처리. 여기선 단순 포맷.
+        try:
+            return date_str.astimezone().strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return date_str.strftime("%Y-%m-%d %H:%M")
     try:
-        # ISO 형식 파싱 시도
-        if 'T' in date_str:
-            dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-            return dt.strftime('%Y-%m-%d %H:%M')
+        if "T" in date_str:
+            dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            return dt.strftime("%Y-%m-%d %H:%M")
         return date_str
     except Exception:
-        return date_str
+        return str(date_str)

@@ -96,16 +96,16 @@ gcloud builds submit --config=deploy/cloudbuild.yaml .
 | `voc-daily-schedule` | 매일 08:00 | 전날 편지/게시글 분류 → voc_labelled |
 | `voc-weekly-schedule` | 매주 월 09:00 | 지난 주 리포트 생성 + Notion/Slack 발행 |
 
-주간 리포트는 월요일 오전에 실행되므로, **일간 파이프라인이 일요일까지 완주되어 있어야 함** (주간은 voc_labelled 읽기 전제 — 현재 v5는 원본에서 다시 분류하므로 무관, 다음 단계에서 voc_labelled 기반으로 전환 예정).
+주간 리포트는 월요일 오전에 실행되므로, **일간 파이프라인이 일요일까지 완주되어 있어야 함** (주간은 voc_labelled 읽기 전제). 일간이 실패하면 sanity check 가 "총 건수 부족/평일 0건" 으로 중단시킴 → 별도 알림 필요.
 
 ## 비용 참고
 
-- **일간**: 500건/일 기준 Bedrock Haiku ≈ $3/일 → 월 $90
-- **주간**: 2600건/주 Bedrock Haiku ≈ $21/주 → 월 $84
-- **Cloud Run**: 실행 시간 기준 (일간 <5분, 주간 <15분) → 월 $1 이하
+- **일간**: 500건/일 기준 Bedrock Haiku ≈ $3/일 → 월 $90 (유일한 분류 비용)
+- **주간**: voc_labelled 재사용 — 톤/인용구 검수 Haiku 호출만 ≈ $0.05/주 → 무시 수준
+- **Cloud Run**: 실행 시간 기준 (일간 <5분, 주간 <5분) → 월 $1 이하
 - **Cloud Scheduler**: 3회/월 무료 초과분 $0.10 → 무시 수준
 
-합계: 약 **월 $175** (주로 분류 비용). 다음 단계에서 주간 리포트가 voc_labelled 재사용하면 **월 $90 수준**으로 절감 가능.
+합계: 약 **월 $90**. 분류는 일간에서 1회만 수행 → 주간은 읽기 전용.
 
 ## 보안
 
@@ -143,6 +143,6 @@ IAM 정책 확인 — 서비스 계정에 `roles/run.invoker` 필요 (`deploy_jo
 ## 다음 단계 (TODO)
 
 - [ ] 채널톡 KcELECTRA 활성화 (메모리 증설 + `--skip-channel` 제거)
-- [ ] 주간 리포트를 voc_labelled 기반으로 전환 (분류 비용 절감)
-- [ ] Cloud Logging → Slack 알림 (실패 시)
-- [ ] 대시보드 Cloud Run 배포 (별도 서비스)
+- [ ] 일간 파이프라인 완료 시 Slack 모니터링 메시지 (대시보드 URL + 부정 이슈 요약)
+- [ ] 일간 파이프라인 실패 시 Slack 알림 (sanity check fail 시 주간이 막히므로)
+- [ ] 대시보드 Cloud Run 배포 (별도 서비스 — BigQuery 직접 연결)

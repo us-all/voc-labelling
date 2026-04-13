@@ -39,7 +39,7 @@ gcloud run jobs deploy voc-daily \
     --cpu=2 \
     --max-retries=1
 
-# ── Job 2: 주간 리포트 ──────────────────────────────
+# ── Job 2: 주간 리포트 (voc_labelled 기반 — 재분류 없음) ──
 echo ">> voc-weekly Cloud Run Job 생성/업데이트"
 gcloud run jobs deploy voc-weekly \
     --image="${IMAGE}" \
@@ -49,8 +49,8 @@ gcloud run jobs deploy voc-weekly \
     --args="scripts/generate_weekly_report_v5.py" \
     --set-env-vars="${COMMON_ENV}" \
     --set-secrets="${SECRETS}" \
-    --task-timeout=3600 \
-    --memory=4Gi \
+    --task-timeout=1800 \
+    --memory=2Gi \
     --cpu=2 \
     --max-retries=0
 

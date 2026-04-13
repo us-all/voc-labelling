@@ -1,11 +1,14 @@
-"""주간 리포트 생성 (v5 4분류) — 원본 조회 → v5 분류 → 리포트
+"""주간 리포트 생성 — voc_labelled 기반 (일간 파이프라인 결과 재사용)
 
-voc_labelled에 분류 데이터가 없는 기간도 처리 가능.
-BigQuery 원본 → Haiku v5 분류 → 통계 분석 → 리포트 생성.
+전제: 일간 파이프라인(`run_daily_pipeline.py`)이 매일 voc_labelled에 분류 결과를
+적재해둔다. 주간 스크립트는 해당 기간을 읽어 통계 + 리포트 생성만 수행.
+
+voc_labelled에 데이터가 없으면 sanity check 에서 fail → 발행 중단.
+원본에서 재분류가 필요한 경우는 별도 백필 스크립트로 처리한다.
 
 사용법:
     python scripts/generate_weekly_report_v5.py                    # 지난 주
-    python scripts/generate_weekly_report_v5.py --start 2026-03-23 --end 2026-03-30
+    python scripts/generate_weekly_report_v5.py --start 2026-04-06 --end 2026-04-13
 """
 import sys
 import os
@@ -19,9 +22,6 @@ load_dotenv()
 
 from src.bigquery.client import BigQueryClient
 from src.bigquery.queries import WeeklyDataQuery
-from src.bigquery.writer import BigQueryWriter
-from src.classifier_v5.classifier import V5Classifier
-from src.classifier_v5.bedrock_classifier import BedrockV5Classifier
 from src.reporter.analytics import WeeklyAnalytics
 from src.reporter.report_generator import ReportGenerator
 from src.reporter.feedback_clusterer import cluster_feedbacks, enrich_master_stats_with_clusters
@@ -34,24 +34,59 @@ from src.utils.excel_exporter import export_to_excel
 from src.utils.run_logger import RunLogger
 
 
-def classify_items(items, content_field, classifier):
-    """v5 분류 결과를 item에 직접 매핑 (analytics 호환)"""
-    if not items:
-        return items
+def load_from_voc_labelled(bq_client, start_date, end_date):
+    """voc_labelled.letters_posts 에서 분류된 데이터 조회 (id 기준 dedup)."""
+    query_sql = f"""
+    SELECT id, source_type, master_id, master_name, user_id,
+           content, created_at, topic, subtag, sentiment, summary, tags,
+           confidence, pipeline_date
+    FROM (
+      SELECT *, ROW_NUMBER() OVER (PARTITION BY id ORDER BY classified_at DESC) as rn
+      FROM `{bq_client.project_id}.voc_labelled.letters_posts`
+      WHERE pipeline_date >= '{start_date}' AND pipeline_date < '{end_date}'
+    )
+    WHERE rn = 1
+    """
+    results = bq_client.execute_query(query_sql)
 
-    classifier.classify_batch(items, content_field=content_field)
+    letters, posts = [], []
+    for r in results:
+        item = dict(r)
+        # analytics 호환 필드 매핑
+        item["masterName"] = item.get("master_name", "Unknown")
+        item["masterId"] = item.get("master_id", "")
+        item["createdAt"] = item.get("created_at", "")
+        item["_id"] = item.get("id", "")
+        if item.get("source_type") == "letter":
+            item["message"] = item.get("content", "")
+            letters.append(item)
+        else:
+            item["textBody"] = item.get("content", "")
+            posts.append(item)
+    return letters, posts
 
-    # classification 결과를 item 최상위 필드로 복사 (analytics 호환)
-    for item in items:
-        cls = item.get("classification", {})
-        item["topic"] = cls.get("topic", "")
-        item["subtag"] = cls.get("subtag", "")
-        item["sentiment"] = cls.get("sentiment", "")
-        item["summary"] = cls.get("summary", "")
-        item["tags"] = cls.get("tags", [])
-        item["confidence"] = cls.get("confidence", 0.0)
 
-    return items
+def count_from_voc_labelled(bq_client, start_date, end_date):
+    """전주 건수만 필요할 때 count-only 조회."""
+    query_sql = f"""
+    SELECT source_type, master_name, COUNT(*) as cnt
+    FROM (
+      SELECT source_type, master_name,
+             ROW_NUMBER() OVER (PARTITION BY id ORDER BY classified_at DESC) as rn
+      FROM `{bq_client.project_id}.voc_labelled.letters_posts`
+      WHERE pipeline_date >= '{start_date}' AND pipeline_date < '{end_date}'
+    )
+    WHERE rn = 1
+    GROUP BY source_type, master_name
+    """
+    letters, posts = [], []
+    for r in bq_client.execute_query(query_sql):
+        stub = {"masterName": r["master_name"] or "Unknown", "createdAt": ""}
+        if r["source_type"] == "letter":
+            letters.extend([stub] * r["cnt"])
+        else:
+            posts.extend([stub] * r["cnt"])
+    return letters, posts
 
 
 def main():
@@ -83,47 +118,22 @@ def main():
     run_logger = RunLogger(start_date)
     run_logger.log(f"=== 주간 리포트 시작 ({start_date} ~ {end_date}) ===", also_print=False)
 
-    # 1. 원본 데이터 조회
-    print(f"\n  Phase 1: BigQuery 원본 조회")
-    master_info = query.get_master_info()
-    data = query.get_weekly_data(start_date, end_date)
-    letters = data["letters"]
-    posts = data["posts"]
-
-    # 마스터 정보 매핑
-    for item in letters:
-        mid = item.get("masterId", "")
-        if mid in master_info:
-            item["masterName"] = master_info[mid].get("displayName") or master_info[mid].get("name", "Unknown")
-    for item in posts:
-        mid = item.get("postBoardId", "")
-        if mid in master_info:
-            item["masterName"] = master_info[mid].get("displayName") or master_info[mid].get("name", "Unknown")
-
+    # 1. voc_labelled 에서 이번 주 분류 데이터 조회
+    print(f"\n  Phase 1: voc_labelled 조회 (일간 파이프라인 결과)")
+    letters, posts = load_from_voc_labelled(bq_client, start_date, end_date)
     print(f"    편지 {len(letters)}건, 게시글 {len(posts)}건")
     run_logger.log(f"Phase 1: 편지 {len(letters)}건, 게시글 {len(posts)}건", also_print=False)
 
-    # 1-1. 전주 데이터 조회 (sanity check 입력용 — 분류 전에 가져옴)
+    # 1-1. 전주 건수 (전주 대비 감소율 sanity check 용)
     from datetime import datetime, timedelta
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     prev_start = (start_dt - timedelta(days=7)).strftime("%Y-%m-%d")
     prev_end = start_date
     print(f"\n  Phase 1-1: 전주 건수 조회 ({prev_start} ~ {prev_end})")
-    prev_data = query.get_weekly_data(prev_start, prev_end)
-    prev_letters = prev_data["letters"]
-    prev_posts = prev_data["posts"]
-    for item in prev_letters:
-        mid = item.get("masterId", "")
-        item["masterName"] = master_info.get(mid, {}).get("displayName", "Unknown")
-    board_query_sql = f"SELECT _id as boardId, masterId FROM `{bq_client.project_id}.us_plus_next.postboards`"
-    board_to_master = {b["boardId"]: b["masterId"] for b in bq_client.execute_query(board_query_sql)}
-    for item in prev_posts:
-        bid = item.get("postBoardId", "")
-        mid = board_to_master.get(bid, bid)
-        item["masterName"] = master_info.get(mid, {}).get("displayName", "Unknown")
+    prev_letters, prev_posts = count_from_voc_labelled(bq_client, prev_start, prev_end)
     print(f"    전주: 편지 {len(prev_letters)}건, 게시글 {len(prev_posts)}건")
 
-    # 1-2. 데이터 건전성 체크 ($21 분류 전에 잡아냄)
+    # 1-2. 데이터 건전성 체크 (일간 파이프라인 실패 감지)
     print(f"\n  Phase 1-2: 데이터 건전성 체크")
     sanity = check_data_health(letters, posts, prev_letters, prev_posts, start_date, end_date)
     run_logger.save_anomalies(sanity.to_dict())
@@ -137,64 +147,11 @@ def main():
             print(f"\n  ⚠️  fail 이지만 --force 로 강제 진행")
             run_logger.log("fail 무시 (--force)", also_print=False)
         else:
-            print(f"\n  🛑 건전성 체크 실패 — 발행 중단. 강제 진행은 --force 사용.")
+            print(f"\n  🛑 건전성 체크 실패 — 발행 중단.")
+            print(f"     일간 파이프라인 완료 여부 확인 필요. 강제 진행은 --force 사용.")
             print(f"     로그: {run_logger.run_dir}/")
             return
 
-    # 2. v5 분류
-    print(f"\n  Phase 2: v5 4분류 (Bedrock Haiku)")
-    bedrock_workers = min(args.workers, 30)  # Bedrock Haiku는 30까지 OK
-    classifier = BedrockV5Classifier(model_id="us.anthropic.claude-3-5-haiku-20241022-v1:0", max_workers=bedrock_workers)
-    start_time = time.time()
-
-    classify_items(letters, "message", classifier)
-    classify_items(posts, "textBody", classifier)
-
-    cost = classifier.get_cost_report()
-    elapsed = time.time() - start_time
-    print(f"    분류 완료: {cost['total_items']}건, {elapsed:.1f}초, ${cost['cost_usd']}")
-
-    # 2-1. 분류 결과 JSON 저장 (로컬 캐시)
-    import json
-    data_dir = os.path.join(os.path.dirname(__file__), "..", "data", "classified_data")
-    os.makedirs(data_dir, exist_ok=True)
-    classified_path = os.path.join(data_dir, f"v5_{start_date}.json")
-    with open(classified_path, "w", encoding="utf-8") as f:
-        json.dump({"letters": letters, "posts": posts}, f, ensure_ascii=False, default=str)
-    print(f"    로컬 저장: {classified_path}")
-
-    # 2-2. BigQuery voc_labelled.letters_posts 저장 (일간 파이프라인과 동일 테이블)
-    # pipeline_date는 각 item의 KST 생성일 기준으로 그룹핑 후 day별 upsert
-    print(f"\n  Phase 2-2: BigQuery voc_labelled 저장")
-    writer = BigQueryWriter(bq_client.client)
-    all_items = letters + posts
-
-    from collections import defaultdict
-    from datetime import datetime as _dt, timedelta as _td
-    items_by_date = defaultdict(list)
-    for item in all_items:
-        created = item.get("createdAt", "")
-        if not created:
-            continue
-        # createdAt은 UTC ISO 문자열 → KST 날짜로 변환
-        try:
-            if isinstance(created, str):
-                utc_dt = _dt.fromisoformat(created.replace("Z", "+00:00"))
-            else:
-                utc_dt = created
-            kst_date = (utc_dt + _td(hours=9)).strftime("%Y-%m-%d")
-            items_by_date[kst_date].append(item)
-        except Exception:
-            pass
-
-    total_written = 0
-    for pipeline_date, day_items in sorted(items_by_date.items()):
-        n = writer.write_letters_posts(day_items, pipeline_date, classifier_model="bedrock-haiku-3.5-v5")
-        total_written += n
-        print(f"    {pipeline_date}: {n}건")
-    print(f"    총 {total_written}건 저장 완료")
-
-    # (전주 데이터는 Phase 1-1 에서 이미 로드됨 — 건전성 체크용으로 미리 가져옴)
     if not prev_letters and not prev_posts:
         prev_letters = None
         prev_posts = None
@@ -265,10 +222,9 @@ def main():
             f.write(cleaned_report)
         report = cleaned_report
 
-    total_cost = classifier.get_cost_report()
-    run_logger.save_cost(total_cost)
+    # 비용: 분류 없음. 톤/인용구 검수 Haiku 호출만 (~$0.05)
+    run_logger.save_cost({"classification": 0.0, "note": "분류는 일간 파이프라인에서 수행"})
     print(f"\n  저장: {output_path}")
-    print(f"  총 비용: ${total_cost['cost_usd']}")
     print(f"  실행 로그: {run_logger.run_dir}/")
 
     # Phase 6: 엑셀 생성
