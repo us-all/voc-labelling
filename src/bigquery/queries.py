@@ -16,7 +16,7 @@ class WeeklyDataQuery:
         """
         self.client = client
         self.project_id = client.project_id
-        self.dataset_id = "us_plus_new"
+        self.dataset_id = "us_plus_next"
 
     @staticmethod
     def _kst_to_utc(date_str: str) -> str:

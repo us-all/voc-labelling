@@ -1,4 +1,4 @@
-"""전주 count만 us_plus_new 원본에서 직접 조회 → 로컬 파일 저장
+"""전주 count만 us_plus_next 원본에서 직접 조회 → 로컬 파일 저장
 
 주간 리포트는 이 파일을 참조할 수 있음 (선택).
 """
@@ -29,7 +29,7 @@ for item in letters:
 posts = query.get_weekly_posts(start, end)
 board_query = f"""
 SELECT _id as boardId, masterId
-FROM `{client.project_id}.us_plus_new.postboards`
+FROM `{client.project_id}.us_plus_next.postboards`
 """
 board_to_master = {b["boardId"]: b["masterId"] for b in client.execute_query(board_query)}
 for item in posts:

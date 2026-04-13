@@ -62,7 +62,7 @@ def generate_week_data(start_date, end_date, data_store, master_info=None):
     client_for_boards = BigQueryClient()
     board_to_master_query = f"""
     SELECT _id as boardId, masterId
-    FROM `{client_for_boards.project_id}.us_plus_new.postboards`
+    FROM `{client_for_boards.project_id}.us_plus_next.postboards`
     """
     board_to_master = {b['boardId']: b['masterId']
                        for b in client_for_boards.execute_query(board_to_master_query)}

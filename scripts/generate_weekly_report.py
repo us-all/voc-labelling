@@ -46,7 +46,7 @@ def load_from_voc_labelled(client, start_date, end_date):
 
 
 def load_previous_week_counts_only(client, start_date, end_date):
-    """전주 데이터 — us_plus_new 원본에서 count만 조회 (분류 없이)
+    """전주 데이터 — us_plus_next 원본에서 count만 조회 (분류 없이)
 
     전주 비교용이라 classification은 불필요, masterName/Id만 있으면 됨.
     voc_labelled에 업로드 안 되어 있어도 동작함.
@@ -67,7 +67,7 @@ def load_previous_week_counts_only(client, start_date, end_date):
     posts = query.get_weekly_posts(start_date, end_date)
     board_query_sql = f"""
     SELECT _id as boardId, masterId
-    FROM `{client.project_id}.us_plus_new.postboards`
+    FROM `{client.project_id}.us_plus_next.postboards`
     """
     board_to_master = {b["boardId"]: b["masterId"] for b in client.execute_query(board_query_sql)}
     for item in posts:
@@ -120,7 +120,7 @@ def main():
     prev_start, prev_end = WeeklyDataQuery.get_previous_week_range()
     print(f"📅 전주 기간: {prev_start} ~ {prev_end}")
 
-    # 전주는 count만 필요하므로 us_plus_new 원본에서 직접 조회 (분류 불필요)
+    # 전주는 count만 필요하므로 us_plus_next 원본에서 직접 조회 (분류 불필요)
     previous_letters, previous_posts = load_previous_week_counts_only(client, prev_start, prev_end)
 
     if previous_letters or previous_posts:

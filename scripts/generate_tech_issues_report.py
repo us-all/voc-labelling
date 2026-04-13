@@ -115,7 +115,7 @@ def fetch_all_data(start_date, end_date):
     # postBoardId → masterId 매핑
     board_query = f"""
     SELECT _id as boardId, masterId
-    FROM `{client.project_id}.us_plus_new.postboards`
+    FROM `{client.project_id}.us_plus_next.postboards`
     """
     board_to_master = {b['boardId']: b['masterId']
                        for b in client.execute_query(board_query)}
