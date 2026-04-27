@@ -24,13 +24,28 @@ V5_SENTIMENTS = ["긍정", "부정", "중립"]
 _SUBTAG_CONFIG = Path(__file__).resolve().parents[2] / "data" / "config" / "v5_subtags.json"
 
 def _load_subtags() -> dict:
-    """v5_subtags.json에서 subtag 목록 로드. 없으면 기본값."""
-    if _SUBTAG_CONFIG.exists():
-        with open(_SUBTAG_CONFIG, encoding="utf-8") as f:
-            return json.load(f)
-    return {t: ["기타"] for t in V5_TOPICS}
+    """v5_subtags.json에서 subtag 목록 로드. 파일이 없으면 fail-loud.
 
-V5_SUBTAGS = _load_subtags()
+    과거에 컨테이너 빌드에서 data/ 가 .dockerignore 로 제외되며 이 파일이
+    누락된 적이 있다 (4/12~4/26 사고). 폴백으로 silent 하게 진행하면
+    valid subtag 목록이 ["기타"] 하나뿐이라 모든 분류가 "기타"로 강제된다.
+    검증 깨짐을 즉시 인지하도록 명시적 RuntimeError 로 잡 자체를 실패시킨다.
+    """
+    if not _SUBTAG_CONFIG.exists():
+        raise RuntimeError(
+            f"subtag 설정 파일 누락: {_SUBTAG_CONFIG}. "
+            "Docker 이미지에 data/config/v5_subtags.json 이 포함됐는지 확인 필요."
+        )
+    with open(_SUBTAG_CONFIG, encoding="utf-8") as f:
+        return json.load(f)
+
+# 모듈 import 자체는 성공시켜야 일간 파이프라인의 try/except 가 동작하고
+# Slack 실패 알림이 발송된다. 실제 검증은 BedrockV5Classifier.__init__ 에서
+# _load_subtags() 를 호출하면서 fail-loud 하게 잡힌다.
+try:
+    V5_SUBTAGS = _load_subtags()
+except RuntimeError:
+    V5_SUBTAGS = {}
 
 
 def _parse_json_response(raw: str) -> dict:
