@@ -227,13 +227,25 @@ def send_slack_alert(items, pipeline_date):
         logger.info("부정 급증 없음 — 알림 없음")
 
 
-def main():
+def build_arg_parser():
     parser = argparse.ArgumentParser(description="일간 VOC 분류 파이프라인")
     parser.add_argument("--date", help="대상 날짜 (YYYY-MM-DD, 기본: 어제)")
     parser.add_argument("--dry-run", action="store_true", help="테스트 모드 (5건만)")
     parser.add_argument("--skip-channel", action="store_true", help="채널톡 건너뛰기")
+    parser.add_argument(
+        "--skip-letters-posts",
+        "--skip-letters",
+        dest="skip_letters_posts",
+        action="store_true",
+        help="편지/게시글 건너뛰기 (채널톡 partition만 재적재할 때 사용)",
+    )
     parser.add_argument("--skip-slack", action="store_true", help="Slack 알림 건너뛰기")
     parser.add_argument("--workers", type=int, default=5, help="병렬 워커 수")
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     # 날짜 설정 — KST 기준 어제 (Cloud Run UTC에서도 동일하게 동작)
@@ -265,46 +277,57 @@ def _run_pipeline(args, target_date, next_date, current_phase, pipeline_start):
     current_phase[0] = "Phase 1: BigQuery 조회"
     logger.info("Phase 1: BigQuery 조회")
     bq_client = BigQueryClient()
-    query = WeeklyDataQuery(bq_client)
-    master_info = query.get_master_info()
+    skip_letters_posts = getattr(args, "skip_letters_posts", False)
+    letters = []
+    posts = []
 
-    data = query.get_weekly_data(target_date, next_date)
-    letters = data["letters"]
-    posts = data["posts"]
+    if skip_letters_posts:
+        logger.info("  편지/게시글 조회 건너뜀 (--skip-letters-posts)")
+    else:
+        query = WeeklyDataQuery(bq_client)
+        master_info = query.get_master_info()
 
-    # 마스터 정보 매핑
-    letters = enrich_master_info(letters, master_info, "masterId")
-    posts = enrich_master_info(posts, master_info, "postBoardId")
+        data = query.get_weekly_data(target_date, next_date)
+        letters = data["letters"]
+        posts = data["posts"]
 
-    # 서비스 공지 필터링
-    letters = filter_service_notices(letters)
-    posts = filter_service_notices(posts)
+        # 마스터 정보 매핑
+        letters = enrich_master_info(letters, master_info, "masterId")
+        posts = enrich_master_info(posts, master_info, "postBoardId")
 
-    logger.info(f"  편지 {len(letters)}건, 게시글 {len(posts)}건")
+        # 서비스 공지 필터링
+        letters = filter_service_notices(letters)
+        posts = filter_service_notices(posts)
 
-    if args.dry_run:
-        letters = letters[:3]
-        posts = posts[:2]
-        logger.info(f"  [DRY RUN] 편지 {len(letters)}건, 게시글 {len(posts)}건으로 제한")
+        logger.info(f"  편지 {len(letters)}건, 게시글 {len(posts)}건")
+
+        if args.dry_run:
+            letters = letters[:3]
+            posts = posts[:2]
+            logger.info(f"  [DRY RUN] 편지 {len(letters)}건, 게시글 {len(posts)}건으로 제한")
 
     # ── Phase 2: 편지글/게시글 분류 (Bedrock Sonnet) ──
     current_phase[0] = "Phase 2: 편지/게시글 분류"
-    logger.info("Phase 2: 편지글/게시글 분류 (Bedrock Sonnet v5 4분류)")
-    classifier = BedrockV5Classifier(max_workers=args.workers)
-
     all_items = []
-    if letters:
-        logger.info(f"  편지 {len(letters)}건 분류 중...")
-        classifier.classify_batch(letters, content_field="message")
-        all_items.extend(letters)
+    cost = {"total_items": 0, "errors": 0, "cost_usd": 0.0}
+    if skip_letters_posts:
+        logger.info("Phase 2: 편지글/게시글 분류 건너뜀 (--skip-letters-posts)")
+    else:
+        logger.info("Phase 2: 편지글/게시글 분류 (Bedrock Haiku v5 4분류)")
+        classifier = BedrockV5Classifier(max_workers=args.workers)
 
-    if posts:
-        logger.info(f"  게시글 {len(posts)}건 분류 중...")
-        classifier.classify_batch(posts, content_field="textBody")
-        all_items.extend(posts)
+        if letters:
+            logger.info(f"  편지 {len(letters)}건 분류 중...")
+            classifier.classify_batch(letters, content_field="message")
+            all_items.extend(letters)
 
-    cost = classifier.get_cost_report()
-    logger.info(f"  분류 완료: {cost['total_items']}건, 에러 {cost['errors']}건, ${cost['cost_usd']}")
+        if posts:
+            logger.info(f"  게시글 {len(posts)}건 분류 중...")
+            classifier.classify_batch(posts, content_field="textBody")
+            all_items.extend(posts)
+
+        cost = classifier.get_cost_report()
+        logger.info(f"  분류 완료: {cost['total_items']}건, 에러 {cost['errors']}건, ${cost['cost_usd']}")
 
     # ── Phase 3: 채널톡 분류 (KcELECTRA + Bedrock) ──
     channel_items = []
@@ -348,7 +371,11 @@ def _run_pipeline(args, target_date, next_date, current_phase, pipeline_start):
     logger.info("Phase 4: BigQuery voc_labelled 저장")
     writer = BigQueryWriter(bq_client.client)
 
-    lp_count = writer.write_letters_posts(all_items, target_date)
+    lp_count = 0
+    if skip_letters_posts:
+        logger.info("  letters_posts 저장 건너뜀 (--skip-letters-posts)")
+    else:
+        lp_count = writer.write_letters_posts(all_items, target_date)
     ch_count = 0
     if channel_items:
         ch_count = writer.write_channel_talk(channel_items, target_date)
