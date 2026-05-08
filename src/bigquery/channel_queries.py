@@ -16,11 +16,12 @@ from .client import BigQueryClient
 class ChannelQueryService:
     """채널톡 메시지 조회 서비스"""
 
-    def __init__(self, client: BigQueryClient):
+    def __init__(self, client: BigQueryClient, channel_name: str = "us-plus"):
         self.client = client
         # 채널톡 데이터는 별도 데이터셋
         self.project_id = client.project_id
         self.dataset_id = "channel_io"
+        self.channel_name = channel_name
 
     def get_weekly_messages(
         self, start_date: str, end_date: str, limit: int = 0
@@ -34,6 +35,8 @@ class ChannelQueryService:
         query = f"""
         SELECT
             chatId,
+            channelId,
+            channelName,
             personType,
             plainText,
             createdAt,
@@ -43,6 +46,7 @@ class ChannelQueryService:
         WHERE
             createdAt >= {start_ts}
             AND createdAt < {end_ts}
+            AND {self._channel_filter_sql()}
         ORDER BY chatId, createdAt
         {limit_clause}
         """
@@ -53,12 +57,15 @@ class ChannelQueryService:
         query = f"""
         SELECT
             chatId,
+            channelId,
+            channelName,
             personType,
             plainText,
             createdAt,
             personId,
             id as messageId
         FROM `{self.project_id}.{self.dataset_id}.messages`
+        WHERE {self._channel_filter_sql()}
         ORDER BY createdAt DESC
         LIMIT {limit}
         """
@@ -76,7 +83,13 @@ class ChannelQueryService:
         if start_date and end_date:
             start_ts = self._kst_to_unix_ms(start_date)
             end_ts = self._kst_to_unix_ms(end_date)
-            where_clause = f"WHERE createdAt >= {start_ts} AND createdAt < {end_ts}"
+            where_clause = (
+                f"WHERE createdAt >= {start_ts} "
+                f"AND createdAt < {end_ts} "
+                f"AND {self._channel_filter_sql()}"
+            )
+        else:
+            where_clause = f"WHERE {self._channel_filter_sql()}"
 
         query = f"""
         SELECT
@@ -111,6 +124,7 @@ class ChannelQueryService:
         WHERE
             createdAt >= {start_ts}
             AND createdAt < {end_ts}
+            AND {self._channel_filter_sql()}
         GROUP BY chatId
         ORDER BY message_count DESC
         """
@@ -135,6 +149,7 @@ class ChannelQueryService:
             SELECT id as chatId, state
             FROM `{self.project_id}.{self.dataset_id}.chats`
             WHERE id IN ({ids_str})
+                AND {self._channel_filter_sql()}
             """
             rows = self.client.execute_query(query)
             for row in rows:
@@ -167,3 +182,7 @@ class ChannelQueryService:
         date = datetime.strptime(date_str, "%Y-%m-%d")
         utc_time = (date - timedelta(hours=9)).replace(tzinfo=timezone.utc)
         return int(utc_time.timestamp() * 1000)
+
+    def _channel_filter_sql(self) -> str:
+        channel_name = self.channel_name.replace("'", "''")
+        return f"channelName = '{channel_name}'"
