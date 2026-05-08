@@ -16,6 +16,19 @@ logger = logging.getLogger(__name__)
 
 MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 V5_SENTIMENTS = ["긍정", "부정", "중립"]
+MODEL_PRICING_PER_MILLION_TOKENS = {
+    "haiku": {"input": 1.0, "output": 5.0},
+    "sonnet": {"input": 3.0, "output": 15.0},
+}
+
+
+def _pricing_for_model(model_id: str) -> dict:
+    """Return input/output USD rates per million tokens for a Claude model."""
+    normalized = (model_id or "").lower()
+    for model_family, pricing in MODEL_PRICING_PER_MILLION_TOKENS.items():
+        if model_family in normalized:
+            return pricing
+    return MODEL_PRICING_PER_MILLION_TOKENS["haiku"]
 
 
 def _parse_json_response(raw: str) -> dict:
@@ -179,8 +192,9 @@ class BedrockV5Classifier:
 
     def get_cost_report(self) -> dict:
         """비용 리포트"""
-        input_cost = self._input_tokens * 3.0 / 1_000_000
-        output_cost = self._output_tokens * 15.0 / 1_000_000
+        pricing = _pricing_for_model(self.model_id)
+        input_cost = self._input_tokens * pricing["input"] / 1_000_000
+        output_cost = self._output_tokens * pricing["output"] / 1_000_000
         return {
             "model": self.model_id,
             "total_items": self._total,
