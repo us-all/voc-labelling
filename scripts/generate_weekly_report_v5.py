@@ -245,7 +245,8 @@ def main():
             start_formatted = datetime.strptime(start_date, '%Y-%m-%d').strftime('%Y.%m.%d')
             end_dt = datetime.strptime(end_date, '%Y-%m-%d')
             end_formatted = (end_dt - timedelta(days=1)).strftime('%m.%d')
-            page_title = f"이용자 반응 리포트 ({start_formatted} ~ {end_formatted})"
+            week_label = SlackNotifier.get_week_label(start_date)
+            page_title = f"[{week_label}] 이용자 반응 리포트 ({start_formatted} ~ {end_formatted})"
             page_info = notion_client.create_report_page(
                 title=page_title,
                 markdown_content=report,
