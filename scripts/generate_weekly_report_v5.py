@@ -89,6 +89,36 @@ def count_from_voc_labelled(bq_client, start_date, end_date):
     return letters, posts
 
 
+def send_insight_failure_alert(fallback_masters, key_issues_failed, active_count, start_date, end_date):
+    """주간 리포트 인사이트(LLM) 생성 전체 실패 시 Slack 즉시 알림 — silent fallback 방지."""
+    try:
+        from src.integrations.slack_client import SlackNotifier
+        slack = SlackNotifier()
+    except Exception:
+        print("  ⚠️  Slack 연동 실패 — 인사이트 실패 알림 건너뜀")
+        return
+
+    parts = [
+        f"🛑 *VOC 주간 리포트 인사이트 생성 실패 — {start_date} ~ {end_date}*",
+        "",
+        f"• 핵심 이슈 생성: {'실패' if key_issues_failed else '정상'}",
+        f"• 마스터 인사이트 fallback: {len(fallback_masters)}/{active_count}명",
+    ]
+    if fallback_masters:
+        head = ", ".join(fallback_masters[:10])
+        parts.append(f"• 대상: {head}" + (" ..." if len(fallback_masters) > 10 else ""))
+    parts += [
+        "",
+        "_Bedrock 모델/자격증명 확인 필요. 카테고리 fallback 형식으로 발행되지 않도록 업로드를 중단했습니다._",
+    ]
+
+    try:
+        slack._send_message("\n".join(parts))
+        print("  📢 인사이트 실패 Slack 알림 전송 완료")
+    except Exception as e:
+        print(f"  ⚠️  인사이트 실패 Slack 알림 전송 실패: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="주간 리포트 생성 (v5)")
     parser.add_argument("--start", help="시작일 (YYYY-MM-DD)")
@@ -196,6 +226,30 @@ def main():
 
     generator = ReportGenerator()
     report = generator.generate_report(stats, start_date, end_date, output_path=output_path)
+
+    # 5-0. 인사이트 생성 건전성 체크 (LLM 장애 감지 — silent fallback 방지)
+    n_active = generator.active_master_count
+    n_fallback = len(generator.insight_fallback_masters)
+    if n_fallback or generator.key_issues_failed:
+        print(f"\n  ⚠️  인사이트 일부 실패: 핵심이슈={'실패' if generator.key_issues_failed else '정상'}, "
+              f"마스터 fallback {n_fallback}/{n_active}명 ({', '.join(generator.insight_fallback_masters)})")
+        run_logger.log(
+            f"insight fallback: key_issues_failed={generator.key_issues_failed}, "
+            f"masters={generator.insight_fallback_masters}",
+            also_print=False,
+        )
+    # 전체 장애 판정: 핵심 이슈 실패 또는 마스터 과반 fallback → 카테고리 형식으로 발행되는 사고 방지
+    insight_outage = generator.key_issues_failed or (n_active > 0 and n_fallback >= n_active * 0.5)
+    if insight_outage and not args.force:
+        print(f"\n  🛑 인사이트 생성 전체 실패 — 발행 중단 (카테고리 fallback 형식 방지).")
+        print(f"     Bedrock 모델/자격증명 확인 필요. 강제 진행은 --force 사용.")
+        print(f"     로그: {run_logger.run_dir}/")
+        if not args.no_upload:
+            send_insight_failure_alert(
+                generator.insight_fallback_masters, generator.key_issues_failed,
+                n_active, start_date, end_date,
+            )
+        return
 
     # 5-1. 톤 검수
     print(f"\n  Phase 5-1: 톤 검수")

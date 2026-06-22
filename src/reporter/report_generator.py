@@ -20,7 +20,11 @@ class ReportGenerator:
         ReportGenerator 초기화 (Bedrock 클라이언트)
         """
         self.bedrock = boto3.client("bedrock-runtime", region_name=os.getenv("AWS_REGION", "us-west-2"))
-        self.model_id = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
+        self.model_id = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        # 인사이트 생성 건전성 추적 (LLM 장애 시 silent fallback 감지용 — fail-loud)
+        self.insight_fallback_masters = []   # fallback으로 떨어진 마스터명
+        self.key_issues_failed = False       # 핵심 이슈 생성 실패 여부
+        self.active_master_count = 0         # 인사이트 생성 대상 마스터 수
 
     def _call_llm(self, prompt: str, max_tokens: int = 2000) -> str:
         """Bedrock Claude API 호출"""
@@ -54,6 +58,11 @@ class ReportGenerator:
         Returns:
             생성된 마크다운 리포트
         """
+        # 건전성 카운터 리셋 (재실행 시 누적 방지)
+        self.insight_fallback_masters = []
+        self.key_issues_failed = False
+        self.active_master_count = 0
+
         # 리포트 헤더 생성
         report = self._generate_header(start_date, end_date, stats)
 
@@ -244,6 +253,8 @@ class ReportGenerator:
         try:
             return self._call_llm(prompt, max_tokens=1500)
         except Exception as e:
+            print(f"⚠️  핵심 이슈 생성 실패: {str(e)}")
+            self.key_issues_failed = True
             return f"- 이번 주 전체 이용자 반응 규모는 총 {total['this_week']['total']}건입니다."
 
     def _generate_master_details(self, stats: Dict[str, Any]) -> str:
@@ -267,6 +278,7 @@ class ReportGenerator:
             (name, data) for name, data in sorted_masters
             if data["this_week"]["total"] < MIN_THRESHOLD
         ]
+        self.active_master_count = len(active_masters)
 
         # LLM API 병렬 호출로 인사이트 생성
         insights = {}
@@ -293,6 +305,8 @@ class ReportGenerator:
                     insights[master_name] = future.result()
                 except Exception as e:
                     print(f"  ⚠️ {master_name} 인사이트 생성 실패: {e}")
+                    if master_name not in self.insight_fallback_masters:
+                        self.insight_fallback_masters.append(master_name)
                     insights[master_name] = self._generate_fallback_insight(
                         dict(active_masters).get(master_name, {})
                     )
@@ -554,6 +568,7 @@ class ReportGenerator:
 
         except Exception as e:
             print(f"⚠️  {master_name} 인사이트 생성 실패: {str(e)}")
+            self.insight_fallback_masters.append(master_name)
 
         # 실패 시 기본값 반환
         return self._generate_fallback_insight(data)
